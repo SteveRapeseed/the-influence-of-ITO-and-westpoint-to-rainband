@@ -1,0 +1,1715 @@
+#!/usr/bin/env python3
+"""TIO warm-year mechanism diagnosis: reproducible publication figures.
+
+DATA DESCRIPTION AND REPRODUCTION NOTES
+========================================
+
+Scientific question
+-------------------
+Diagnose the evidence chain associated with TIO warming during boreal summer:
+
+    TIO SST warming -> upper-tropospheric divergent/Kelvin-wave-like response
+    -> western North Pacific anomalous anticyclone (WNPAC)
+    -> suppressed convection -> westward displacement of the WPSH contour.
+
+Input files
+-----------
+The directory passed with --data-dir must contain:
+
+1. HadISST_sst.nc
+   Monthly sea-surface temperature; variable ``sst``.
+2. ncep.uwnd.mon.mean.nc
+   Monthly zonal wind; variable ``uwnd``; levels 200 and 850 hPa.
+3. ncep.vwnd.mon.mean.nc
+   Monthly meridional wind; variable ``vwnd``; levels 200 and 850 hPa.
+4. ncep.hgt.mon.mean.nc
+   Monthly geopotential height; variable ``hgt``; 500-hPa level.
+5. noaa.olr.mon.mean.nc
+   Monthly outgoing longwave radiation; variable ``olr``.
+6. TIO_JJA.csv
+   TIO index table with columns ``year`` and ``TIO_JJA_std``.
+
+Time period and sample definition
+----------------------------------
+- Analysis period: 1979-2020.
+- Season: JJA (June, July, August), weighted by the number of days in each month.
+- Anomaly climatology: 1981-2010 JJA mean.
+- Warm year criterion: standardized TIO_JJA > 0.75 standard deviations.
+- For the supplied index, the warm years are 1983, 1987, 1988, 1998, 2003,
+  2007, 2009, 2010, 2014, 2015, 2016, 2017, 2019 and 2020 (n = 14).
+  The script recalculates this list from TIO_JJA.csv; it is not hard-coded.
+
+Diagnostics
+-----------
+- SST, OLR and 500-hPa height fields are composited across the selected warm years.
+- 200-hPa wind is Helmholtz-decomposed with ``VectorWind`` into velocity potential
+  and divergent wind.
+- 850-hPa wind is decomposed into streamfunction and rotational wind; the same
+  level also supplies the divergence and total-wind panel.
+- Equatorial zonal wind is averaged over 5°S-5°N for the 200/850-hPa profile.
+- The 5880-gpm contours compare the 1981-2010 climatology with the warm-year
+  absolute 500-hPa height field (climatology + anomaly).
+- Stippling uses a nominal two-sided one-sample t test across warm years,
+  p < 0.05. Serial dependence and field-significance corrections are not applied.
+
+Panel definitions in the six-panel output
+------------------------------------------
+- (a) TIO SST anomaly, °C.
+- (b) 200-hPa velocity potential and divergent wind.
+- (c) Equatorial zonal-wind anomalies at 200 and 850 hPa.
+- (d) 850-hPa streamfunction and rotational wind; WNPAC box is 110-150°E,
+  10-25°N.
+- (e) 850-hPa divergence, total wind and the +4 W m^-2 OLR contour.
+- (f) 500-hPa height anomaly and 5880-gpm contours.
+
+Wind-arrow settings for the current six-panel version
+------------------------------------------------------
+- d: sample every 3 latitude grid cells and 4 longitude grid cells;
+  scale=3.0, width=0.0016, headwidth=3.4, headlength=4.1,
+  headaxislength=3.7.
+- e: same sampling density, but shorter arrows;
+  scale=3.6, width=0.0015, headwidth=3.2, headlength=3.8,
+  headaxislength=3.4.
+- A larger ``scale`` produces shorter arrows in Matplotlib quiver.
+
+Outputs
+-------
+The script writes PNG (600 dpi), PDF and SVG figure files, TIFF where requested,
+diagnostic CSV files, alignment JSON and caption text to --output-dir.
+
+Example
+-------
+python TIO_mechanism_diagnosis_6panel_e_short_documented.py \
+    --data-dir data \
+    --output-dir outputs/mechanism_diagnosis
+
+Required Python packages include numpy, pandas, xarray, scipy, matplotlib,
+cartopy, Pillow and skyborn.windspharm. The local ``audit_panel_alignment.py``
+helper is used for the multi-panel alignment gate.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+_DEFAULT_DEPENDENCY_DIR = Path(__file__).resolve().parent / "python_deps"
+if _DEFAULT_DEPENDENCY_DIR.is_dir():
+    sys.path.insert(0, str(_DEFAULT_DEPENDENCY_DIR))
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xarray as xr
+from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter
+from matplotlib.ticker import MaxNLocator
+from matplotlib.transforms import ScaledTranslation
+from PIL import Image
+from scipy.stats import t, ttest_1samp
+from skyborn.windspharm.xarray import VectorWind
+
+from audit_panel_alignment import require_matplotlib_panel_alignment
+
+
+MM_PER_INCH = 25.4
+FIG_DPI = 600
+JJA_MONTHS = (6, 7, 8)
+TIO_REGION = (40.0, 110.0, -20.0, 20.0)
+WNPAC_REGION = (110.0, 150.0, 10.0, 25.0)
+WEST_PACIFIC = (120.0, 160.0)
+PROJECTION = ccrs.PlateCarree()
+
+mpl.rcParams.update(
+    {
+        "font.family": "sans-serif",
+        "font.sans-serif": ["DejaVu Sans", "Arial", "Helvetica"],
+        "font.size": 7,
+        "axes.linewidth": 0.55,
+        "axes.labelsize": 6.5,
+        "xtick.labelsize": 5.8,
+        "ytick.labelsize": 5.8,
+        "xtick.major.width": 0.5,
+        "ytick.major.width": 0.5,
+        "xtick.major.size": 2.5,
+        "ytick.major.size": 2.5,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "svg.fonttype": "none",
+        "savefig.dpi": FIG_DPI,
+        "savefig.facecolor": "white",
+        "savefig.edgecolor": "white",
+        "savefig.transparent": False,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "legend.frameon": False,
+        "mathtext.fontset": "dejavusans",
+    }
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    script_dir = Path(__file__).resolve().parent
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs") / "mechanism_diagnosis",
+    )
+    parser.add_argument("--year-start", type=int, default=1979)
+    parser.add_argument("--year-end", type=int, default=2020)
+    parser.add_argument("--clim-start", type=int, default=1981)
+    parser.add_argument("--clim-end", type=int, default=2010)
+    parser.add_argument("--warm-threshold", type=float, default=0.75)
+    parser.add_argument(
+        "--dependency-dir",
+        type=Path,
+        default=None,
+        help="Optional directory containing the isolated plotting dependencies.",
+    )
+    return parser.parse_args()
+
+
+def normalize_coords(da: xr.DataArray) -> xr.DataArray:
+    rename = {}
+    if "latitude" in da.dims:
+        rename["latitude"] = "lat"
+    if "longitude" in da.dims:
+        rename["longitude"] = "lon"
+    if rename:
+        da = da.rename(rename)
+    if "lon" not in da.coords or "lat" not in da.coords:
+        raise ValueError(f"{da.name!r} has no recognized latitude/longitude axes.")
+    lon = da["lon"].values
+    if np.nanmin(lon) < 0:
+        da = da.assign_coords(lon=np.mod(lon, 360.0))
+    return da.sortby("lon")
+
+
+def load_jja_anomalies(
+    path: Path,
+    variable: str,
+    year_start: int,
+    year_end: int,
+    clim_start: int,
+    clim_end: int,
+    level: float | None = None,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """Return annual JJA anomalies and the reference-period JJA climatology."""
+    with xr.open_dataset(path, decode_times=True) as ds:
+        da = ds[variable]
+        if level is not None:
+            da = da.sel(level=level)
+        da = normalize_coords(da)
+        year_mask = (da.time.dt.year >= year_start) & (da.time.dt.year <= year_end)
+        da = da.where(year_mask, drop=True)
+        jja = da.where(da.time.dt.month.isin(JJA_MONTHS), drop=True)
+
+        month_days = xr.DataArray(
+            jja.time.dt.days_in_month.astype("float64").values,
+            dims=("time",),
+            coords={"time": jja.time},
+        )
+        weighted_sum = (jja * month_days).groupby("time.year").sum(
+            "time", skipna=True
+        )
+        valid_days = (xr.ones_like(jja, dtype="float64") * month_days).where(
+            jja.notnull()
+        )
+        denominator = valid_days.groupby("time.year").sum("time", skipna=True)
+        annual = (weighted_sum / denominator).load()
+
+    climatology_years = annual.sel(year=slice(clim_start, clim_end))
+    if climatology_years.sizes.get("year", 0) == 0:
+        raise ValueError(f"No reference years {clim_start}-{clim_end} in {path.name}.")
+    climatology = climatology_years.mean("year", skipna=True)
+    anomalies = (annual - climatology).load()
+    return anomalies, climatology.load()
+
+
+def warm_years_from_index(
+    data_dir: Path,
+    year_start: int,
+    year_end: int,
+    threshold: float,
+) -> tuple[list[int], pd.DataFrame]:
+    index = pd.read_csv(data_dir / "TIO_JJA.csv")
+    required = {"year", "TIO_JJA_std"}
+    missing = required.difference(index.columns)
+    if missing:
+        raise ValueError(f"TIO_JJA.csv is missing columns: {sorted(missing)}")
+    index["year"] = pd.to_numeric(index["year"], errors="coerce")
+    index["TIO_JJA_std"] = pd.to_numeric(index["TIO_JJA_std"], errors="coerce")
+    eligible = index["year"].between(year_start, year_end)
+    warm = index.loc[eligible & (index["TIO_JJA_std"] > threshold)].copy()
+    years = sorted(warm["year"].astype(int).unique().tolist())
+    if not years:
+        raise ValueError("The warm-year threshold selected no years.")
+    warm.attrs["threshold_sigma"] = threshold
+    return years, warm.sort_values("year")
+
+
+def require_years(da: xr.DataArray, years: list[int], label: str) -> xr.DataArray:
+    available = set(np.asarray(da["year"].values, dtype=int).tolist())
+    missing = sorted(set(years).difference(available))
+    if missing:
+        raise ValueError(f"{label} is missing requested warm years: {missing}")
+    return da.sel(year=years)
+
+
+def composite(da: xr.DataArray, years: list[int]) -> xr.DataArray:
+    return require_years(da, years, str(da.name)).mean("year", skipna=True)
+
+
+def stack_p_values(stack: xr.DataArray, dim: str = "warm_year") -> xr.DataArray:
+    test = ttest_1samp(
+        stack.values,
+        popmean=0.0,
+        axis=stack.get_axis_num(dim),
+        nan_policy="omit",
+    )
+    dims = tuple(d for d in stack.dims if d != dim)
+    coords = {d: stack[d] for d in dims}
+    p = np.asarray(test.pvalue)
+    p[~np.isfinite(p)] = 1.0
+    return xr.DataArray(p, dims=dims, coords=coords, name="p_value")
+
+
+def add_significance_dots(
+    ax,
+    p_values: xr.DataArray,
+    extent: tuple[float, float, float, float],
+    stride: int = 2,
+) -> None:
+    lon_min, lon_max, lat_min, lat_max = extent
+    p_map = p_values.where(
+        (p_values.lon >= lon_min)
+        & (p_values.lon <= lon_max)
+        & (p_values.lat >= lat_min)
+        & (p_values.lat <= lat_max),
+        drop=True,
+    )
+    if p_map.sizes.get("lat", 0) == 0 or p_map.sizes.get("lon", 0) == 0:
+        return
+    p_map = p_map.isel(lat=slice(None, None, stride), lon=slice(None, None, stride))
+    yy, xx = np.where(p_map.values < 0.05)
+    if len(xx):
+        ax.scatter(
+            p_map.lon.values[xx],
+            p_map.lat.values[yy],
+            s=1.0,
+            marker=".",
+            color="#202020",
+            alpha=0.58,
+            linewidths=0,
+            transform=PROJECTION,
+            zorder=7,
+        )
+
+
+def subset_region(
+    da: xr.DataArray, extent: tuple[float, float, float, float]
+) -> xr.DataArray:
+    lon_min, lon_max, lat_min, lat_max = extent
+    return da.where(
+        (da.lon >= lon_min)
+        & (da.lon <= lon_max)
+        & (da.lat >= lat_min)
+        & (da.lat <= lat_max),
+        drop=True,
+    )
+
+
+def area_weighted_mean(
+    da: xr.DataArray, region: tuple[float, float, float, float]
+) -> float:
+    lon_min, lon_max, lat_min, lat_max = region
+    sub = da.where(
+        (da.lon >= lon_min)
+        & (da.lon <= lon_max)
+        & (da.lat >= lat_min)
+        & (da.lat <= lat_max),
+        drop=True,
+    )
+    weights = np.cos(np.deg2rad(sub.lat))
+    return float(sub.weighted(weights).mean(("lat", "lon"), skipna=True).values)
+
+
+def zonal_mean_equatorial(da: xr.DataArray) -> xr.DataArray:
+    mask = (da.lat >= -5.0) & (da.lat <= 5.0)
+    eq = da.where(mask, drop=True)
+    if eq.sizes.get("lat", 0) == 0:
+        raise ValueError("No latitude cells fall within 5°S-5°N.")
+    weights = np.cos(np.deg2rad(eq.lat))
+    return eq.weighted(weights).mean("lat", skipna=True)
+
+
+def vector_diagnostics(
+    u_annual: xr.DataArray,
+    v_annual: xr.DataArray,
+    years: list[int],
+    diagnostics: tuple[str, ...],
+) -> dict[str, xr.DataArray]:
+    """Compute spherical-harmonic wind diagnostics for each warm year."""
+    results: dict[str, list[xr.DataArray]] = {name: [] for name in diagnostics}
+    for year in years:
+        u = u_annual.sel(year=year, drop=True).transpose("lat", "lon")
+        v = v_annual.sel(year=year, drop=True).transpose("lat", "lon")
+        wind = VectorWind(u, v, gridtype="regular")
+        for name in diagnostics:
+            if name == "chi":
+                value = wind.velocitypotential()
+            elif name == "psi":
+                value = wind.streamfunction()
+            elif name == "divergence":
+                value = wind.divergence()
+            elif name == "divergent_wind":
+                value = wind.irrotationalcomponent()
+            elif name == "rotational_wind":
+                value = wind.nondivergentcomponent()
+            else:
+                raise ValueError(f"Unknown vector diagnostic: {name}")
+            if isinstance(value, tuple):
+                results[name].append(xr.concat(value, dim="component"))
+            else:
+                results[name].append(value)
+    output = {}
+    for name, values in results.items():
+        stack = xr.concat(
+            values,
+            dim=xr.IndexVariable("warm_year", np.asarray(years, dtype=int)),
+        ).load()
+        output[name] = stack
+    return output
+
+
+def confidence_interval(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = values.shape[0]
+    mean = np.nanmean(values, axis=0)
+    spread = np.nanstd(values, axis=0, ddof=1)
+    margin = t.ppf(0.975, n - 1) * spread / np.sqrt(n)
+    return mean, mean - margin, mean + margin
+
+
+def draw_region_box(
+    ax,
+    region: tuple[float, float, float, float],
+    color: str,
+    linestyle: str = "-",
+    linewidth: float = 1.0,
+) -> None:
+    lon0, lon1, lat0, lat1 = region
+    ax.plot(
+        [lon0, lon1, lon1, lon0, lon0],
+        [lat0, lat0, lat1, lat1, lat0],
+        color=color,
+        linewidth=linewidth,
+        linestyle=linestyle,
+        transform=PROJECTION,
+        zorder=8,
+        clip_on=True,
+    )
+
+
+def setup_map(ax, extent, xticks, yticks, title: str) -> None:
+    ax.set_extent(extent, crs=PROJECTION)
+    ax.add_feature(
+        cfeature.LAND,
+        facecolor="#e8e8e8",
+        edgecolor="none",
+        zorder=3,
+    )
+    coastlines = ax.coastlines(
+        resolution="110m", linewidth=0.36, color="#272727", zorder=4
+    )
+    coastlines.set_rasterized(True)
+    gridliner = ax.gridlines(
+        crs=PROJECTION,
+        draw_labels=False,
+        linewidth=0.35,
+        color="#777777",
+        alpha=0.34,
+        linestyle=":",
+        zorder=5,
+    )
+    ax._tio_gridliner = gridliner
+    ax.set_xticks(xticks, crs=PROJECTION)
+    ax.set_yticks(yticks, crs=PROJECTION)
+    ax.xaxis.set_major_formatter(LongitudeFormatter())
+    ax.yaxis.set_major_formatter(LatitudeFormatter())
+    ax.tick_params(axis="both", pad=1.5)
+    ax.set_title(title, loc="left", fontsize=7.2, fontweight="bold", pad=5.5)
+
+
+def quiver_on_map(
+    ax,
+    u: xr.DataArray,
+    v: xr.DataArray,
+    extent,
+    *,
+    stride_lat: int = 5,
+    stride_lon: int = 8,
+    scale: float = 2.8,
+    width: float = 0.0014,
+    headwidth: float = 3.3,
+    headlength: float = 4.0,
+    headaxislength: float = 3.6,
+    alpha: float = 0.75,
+):
+    """Draw a sampled vector field with controllable density and prominence."""
+    us = subset_region(u, extent).isel(
+        lat=slice(None, None, stride_lat), lon=slice(None, None, stride_lon)
+    )
+    vs = subset_region(v, extent).isel(
+        lat=slice(None, None, stride_lat), lon=slice(None, None, stride_lon)
+    )
+    return ax.quiver(
+        us.lon.values,
+        us.lat.values,
+        us.values,
+        vs.values,
+        transform=PROJECTION,
+        color="#202020",
+        alpha=alpha,
+        scale_units="inches",
+        scale=scale,
+        width=width,
+        headwidth=headwidth,
+        headlength=headlength,
+        headaxislength=headaxislength,
+        pivot="mid",
+        zorder=6,
+    )
+
+
+def add_quiver_key(
+    ax,
+    q,
+    text: str = "0.5 m s⁻¹",
+    *,
+    x: float = 0.06,
+    y: float = 0.07,
+) -> None:
+    ax.quiverkey(
+        q,
+        X=x,
+        Y=y,
+        U=0.5,
+        label=text,
+        labelpos="E",
+        coordinates="axes",
+        fontproperties={"size": 5.4},
+        labelsep=0.03,
+    )
+
+
+def stack_field(
+    annual: xr.DataArray, years: list[int], name: str
+) -> xr.DataArray:
+    field = require_years(annual, years, name).rename({"year": "warm_year"})
+    return field.assign_coords(warm_year=np.asarray(years, dtype=int))
+
+
+def west_edge_longitude(
+    field: xr.DataArray,
+    threshold: float = 5880.0,
+    lat_range: tuple[float, float] = (10.0, 30.0),
+    lon_range: tuple[float, float] = (80.0, 180.0),
+) -> float:
+    subset = field.where(
+        (field.lat >= lat_range[0])
+        & (field.lat <= lat_range[1])
+        & (field.lon >= lon_range[0])
+        & (field.lon <= lon_range[1]),
+        drop=True,
+    )
+    lon = subset.lon.values.astype(float)
+    estimates = []
+    weights = []
+    for lat_value, row in zip(subset.lat.values, subset.values):
+        finite = np.isfinite(row)
+        if finite.sum() < 2:
+            continue
+        row = row[finite]
+        x = lon[finite]
+        crossings = []
+        if row[0] >= threshold:
+            crossings.append(float(x[0]))
+        else:
+            for i in range(len(row) - 1):
+                if row[i] < threshold <= row[i + 1]:
+                    fraction = (threshold - row[i]) / (row[i + 1] - row[i])
+                    crossings.append(float(x[i] + fraction * (x[i + 1] - x[i])))
+        if crossings:
+            estimates.append(min(crossings))
+            weights.append(np.cos(np.deg2rad(lat_value)))
+    if not estimates:
+        return float("nan")
+    return float(np.average(estimates, weights=weights))
+
+
+def run_vector_diagnostics(
+    data_dir: Path,
+    warm_years: list[int],
+    year_start: int,
+    year_end: int,
+    clim_start: int,
+    clim_end: int,
+) -> dict[str, xr.DataArray]:
+    output: dict[str, xr.DataArray] = {}
+    for level, prefix in ((200.0, "200"), (850.0, "850")):
+        u, _ = load_jja_anomalies(
+            data_dir / "ncep.uwnd.mon.mean.nc",
+            "uwnd",
+            year_start,
+            year_end,
+            clim_start,
+            clim_end,
+            level,
+        )
+        v, _ = load_jja_anomalies(
+            data_dir / "ncep.vwnd.mon.mean.nc",
+            "vwnd",
+            year_start,
+            year_end,
+            clim_start,
+            clim_end,
+            level,
+        )
+        u = require_years(u, warm_years, f"u{prefix}")
+        v = require_years(v, warm_years, f"v{prefix}")
+        output[f"u{prefix}_annual"] = u
+        output[f"v{prefix}_annual"] = v
+        if prefix == "200":
+            diagnostics = vector_diagnostics(
+                u, v, warm_years, ("chi", "divergent_wind")
+            )
+            output["chi_stack"] = diagnostics["chi"]
+            output["divergent_wind_stack"] = diagnostics["divergent_wind"]
+        else:
+            diagnostics = vector_diagnostics(
+                u, v, warm_years, ("psi", "divergence", "rotational_wind")
+            )
+            output["psi_stack"] = diagnostics["psi"]
+            output["div850_stack"] = diagnostics["divergence"]
+            output["rotational_wind_stack"] = diagnostics["rotational_wind"]
+    return output
+
+
+def make_products(
+    data_dir: Path,
+    output_dir: Path,
+    warm_years: list[int],
+    warm_index: pd.DataFrame,
+    data: dict[str, xr.DataArray],
+    years: tuple[int, int],
+    climatology_years: tuple[int, int],
+) -> dict[str, object]:
+    start, end = years
+    clim_start, clim_end = climatology_years
+
+    sst, sst_clim = load_jja_anomalies(
+        data_dir / "HadISST_sst.nc",
+        "sst",
+        start,
+        end,
+        clim_start,
+        clim_end,
+    )
+    olr, _ = load_jja_anomalies(
+        data_dir / "noaa.olr.mon.mean.nc",
+        "olr",
+        start,
+        end,
+        clim_start,
+        clim_end,
+    )
+    hgt, hgt_clim = load_jja_anomalies(
+        data_dir / "ncep.hgt.mon.mean.nc",
+        "hgt",
+        start,
+        end,
+        clim_start,
+        clim_end,
+        level=500.0,
+    )
+    for label, annual in (("SST", sst), ("OLR", olr), ("HGT500", hgt)):
+        require_years(annual, warm_years, label)
+
+    sst_stack = stack_field(sst, warm_years, "SST")
+    olr_stack = stack_field(olr, warm_years, "OLR")
+    hgt_stack = stack_field(hgt, warm_years, "HGT500")
+
+    chi_stack = data["chi_stack"]
+    psi_stack = data["psi_stack"]
+    div_stack = data["div850_stack"]
+    div_wind_stack = data["divergent_wind_stack"]
+    rot_wind_stack = data["rotational_wind_stack"]
+
+    fields = {
+        "sst": sst_stack.mean("warm_year", skipna=True),
+        "olr": olr_stack.mean("warm_year", skipna=True),
+        "hgt": hgt_stack.mean("warm_year", skipna=True),
+        "chi": chi_stack.mean("warm_year", skipna=True),
+        "psi": psi_stack.mean("warm_year", skipna=True),
+        "div850": div_stack.mean("warm_year", skipna=True),
+        "divergent_u200": div_wind_stack.sel(component=0).mean(
+            "warm_year", skipna=True
+        ),
+        "divergent_v200": div_wind_stack.sel(component=1).mean(
+            "warm_year", skipna=True
+        ),
+        "rotational_u850": rot_wind_stack.sel(component=0).mean(
+            "warm_year", skipna=True
+        ),
+        "rotational_v850": rot_wind_stack.sel(component=1).mean(
+            "warm_year", skipna=True
+        ),
+        "u850": data["u850_annual"].mean("year", skipna=True),
+        "v850": data["v850_annual"].mean("year", skipna=True),
+        "u200": data["u200_annual"].mean("year", skipna=True),
+        "u850_annual": data["u850_annual"],
+        "u200_annual": data["u200_annual"],
+        "hgt_clim": hgt_clim,
+    }
+    p_fields = {
+        "sst": stack_p_values(sst_stack),
+        "olr": stack_p_values(olr_stack),
+        "hgt": stack_p_values(hgt_stack),
+        "chi": stack_p_values(chi_stack),
+        "psi": stack_p_values(psi_stack),
+        "div850": stack_p_values(div_stack),
+    }
+
+    hgt_abs_warm = fields["hgt_clim"] + fields["hgt"]
+    west_clim = west_edge_longitude(fields["hgt_clim"])
+    west_warm = west_edge_longitude(hgt_abs_warm)
+
+    profile200_yearly = zonal_mean_equatorial(data["u200_annual"])
+    profile850_yearly = zonal_mean_equatorial(data["u850_annual"])
+    profile200 = require_years(profile200_yearly, warm_years, "equatorial u200")
+    profile850 = require_years(profile850_yearly, warm_years, "equatorial u850")
+    profile200_mean = profile200.mean("year", skipna=True)
+    profile850_mean = profile850.mean("year", skipna=True)
+    baroclinic_yearly = profile200 - profile850
+    wp_baroclinic_by_year = baroclinic_yearly.sel(lon=slice(*WEST_PACIFIC)).mean(
+        "lon", skipna=True
+    )
+    wp_baroclinic_mean = float(wp_baroclinic_by_year.mean("year").values)
+    wp_baroclinic_p = float(
+        ttest_1samp(wp_baroclinic_by_year.values, 0.0, nan_policy="omit").pvalue
+    )
+    u200_wp = float(profile200_mean.sel(lon=slice(*WEST_PACIFIC)).mean("lon").values)
+    u850_wp = float(profile850_mean.sel(lon=slice(*WEST_PACIFIC)).mean("lon").values)
+
+    summary = {
+        "period_start": start,
+        "period_end": end,
+        "climatology_start": clim_start,
+        "climatology_end": clim_end,
+        "warm_threshold_sigma": float(warm_index.attrs.get("threshold_sigma", np.nan)),
+        "n_warm_years": len(warm_years),
+        "warm_years": ",".join(str(y) for y in warm_years),
+        "tio_sst_warm_composite_c": area_weighted_mean(fields["sst"], TIO_REGION),
+        "olr_tio_warm_composite_w_m2": area_weighted_mean(
+            fields["olr"], TIO_REGION
+        ),
+        "olr_wnpac_warm_composite_w_m2": area_weighted_mean(
+            fields["olr"], WNPAC_REGION
+        ),
+        "chi200_tio_mean_m2_s": area_weighted_mean(fields["chi"], TIO_REGION),
+        "chi200_west_pacific_mean_m2_s": area_weighted_mean(
+            fields["chi"], WNPAC_REGION
+        ),
+        "psi850_wnpac_mean_m2_s": area_weighted_mean(fields["psi"], WNPAC_REGION),
+        "div850_wnpac_mean_s-1": area_weighted_mean(
+            fields["div850"], WNPAC_REGION
+        ),
+        "u200_west_pacific_equatorial_m_s": u200_wp,
+        "u850_west_pacific_equatorial_m_s": u850_wp,
+        "u200_minus_u850_west_pacific_m_s": wp_baroclinic_mean,
+        "u200_minus_u850_one_sample_p": wp_baroclinic_p,
+        "hgt500_west_edge_climatology_deg_e": west_clim,
+        "hgt500_west_edge_warm_deg_e": west_warm,
+        "hgt500_5880_geometric_shift_deg_e": west_warm - west_clim,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    warm_index[["year", "TIO_JJA_std"]].to_csv(
+        output_dir / "tio_warm_years.csv", index=False
+    )
+    pd.DataFrame(
+        [{"diagnostic": key, "value": value} for key, value in summary.items()]
+    ).to_csv(output_dir / "mechanism_diagnostics.csv", index=False)
+    return {
+        "fields": fields,
+        "p_fields": p_fields,
+        "hgt_abs_warm": hgt_abs_warm,
+        "profile200_yearly": profile200,
+        "profile850_yearly": profile850,
+        "profile200_mean": profile200_mean,
+        "profile850_mean": profile850_mean,
+        "baroclinic_yearly": baroclinic_yearly,
+        "summary": summary,
+        "sst_clim": sst_clim,
+        "olr_stack": olr_stack,
+        "sst_stack": sst_stack,
+        "hgt_stack": hgt_stack,
+        "chi_stack": chi_stack,
+        "psi_stack": psi_stack,
+        "div_stack": div_stack,
+    }
+
+
+def map_axes(
+    fig,
+    position: tuple[float, float, float, float],
+    extent,
+    xticks,
+    yticks,
+    title: str,
+):
+    ax = fig.add_axes(position, projection=PROJECTION)
+    setup_map(ax, extent, xticks, yticks, title)
+    return ax
+
+
+def add_main_colorbar(fig, mappable, position, label, ticks, ticklabels=None):
+    cax = fig.add_axes(position)
+    cb = fig.colorbar(mappable, cax=cax, orientation="horizontal", extend="both")
+    cb.set_label(label, fontsize=6.2, labelpad=1.6)
+    cb.set_ticks(ticks)
+    if ticklabels is not None:
+        cb.set_ticklabels(ticklabels)
+    cb.ax.tick_params(labelsize=5.6, length=2.1, width=0.45, pad=1.4)
+    cb.outline.set_linewidth(0.45)
+    return cb
+
+
+def export_figure(
+    fig,
+    output_dir: Path,
+    stem: str,
+    panel_axes,
+    panel_ids,
+    row_groups,
+    column_groups,
+    formats=("png", "pdf", "svg"),
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base = output_dir / stem
+    for ax, panel_id in zip(panel_axes, panel_ids):
+        # Keep clipped scientific geometry rasterized while labels stay editable.
+        for artist in (*ax.collections, *ax.lines, *ax.patches):
+            if artist is not ax.patch:
+                artist.set_rasterized(True)
+        for title_obj in (
+            ax.title,
+            getattr(ax, "_left_title", None),
+            getattr(ax, "_right_title", None),
+        ):
+            if title_obj is not None:
+                title_obj.set_text(
+                    re.sub(r"^\([a-z]\)\s*", "", title_obj.get_text())
+                )
+        label_offset = ScaledTranslation(-10.0 / 72.0, 3.5 / 72.0, fig.dpi_scale_trans)
+        ax.text(
+            0.0,
+            1.0,
+            panel_id,
+            transform=ax.transAxes + label_offset,
+            fontsize=8.0,
+            fontweight="bold",
+            ha="left",
+            va="bottom",
+            clip_on=False,
+        )
+    fig.canvas.draw()
+    for ax in panel_axes:
+        gridliner = getattr(ax, "_tio_gridliner", None)
+        if gridliner is not None:
+            grid_artists = (
+                *getattr(gridliner, "xline_artists", ()),
+                *getattr(gridliner, "yline_artists", ()),
+            )
+            for artist in grid_artists:
+                artist.set_rasterized(True)
+    fig.canvas.draw()
+    require_matplotlib_panel_alignment(
+        fig,
+        axes=panel_axes,
+        panel_ids=panel_ids,
+        row_groups=row_groups,
+        column_groups=column_groups,
+        json_out=str(base) + ".alignment.json",
+        overlay_svg=str(base) + ".alignment.svg",
+        tolerance_pt=1.5,
+        gutter_tolerance_pt=1.5,
+        require_panel_labels=True,
+        strict=True,
+    )
+    saved = []
+    if "png" in formats:
+        path = base.with_suffix(".png")
+        fig.savefig(path, format="png", dpi=FIG_DPI, facecolor="white", transparent=False)
+        with Image.open(path) as image:
+            rgb = image.convert("RGB")
+            temporary = path.with_name(path.stem + ".rgb.tmp.png")
+            rgb.save(temporary, dpi=(FIG_DPI, FIG_DPI))
+        temporary.replace(path)
+        saved.append(path)
+    if "pdf" in formats:
+        path = base.with_suffix(".pdf")
+        fig.savefig(path, format="pdf", facecolor="white", transparent=False)
+        saved.append(path)
+    if "svg" in formats:
+        path = base.with_suffix(".svg")
+        fig.savefig(path, format="svg", facecolor="white", transparent=False)
+        saved.append(path)
+    if "tif" in formats:
+        path = base.with_suffix(".tif")
+        fig.savefig(
+            path,
+            format="tif",
+            dpi=FIG_DPI,
+            facecolor="white",
+            transparent=False,
+            pil_kwargs={"compression": "tiff_lzw"},
+        )
+        with Image.open(path) as image:
+            rgb = image.convert("RGB")
+            temporary = path.with_name(path.stem + ".rgb.tmp.tif")
+            rgb.save(temporary, dpi=(FIG_DPI, FIG_DPI), compression="tiff_lzw")
+        temporary.replace(path)
+        saved.append(path)
+    plt.close(fig)
+    return saved
+
+
+def main_figure(products, output_dir: Path, warm_years: list[int], formats) -> None:
+    fields = products["fields"]
+    p = products["p_fields"]
+    hgt_abs = products["hgt_abs_warm"]
+    summary = products["summary"]
+    fig = plt.figure(figsize=(180 / MM_PER_INCH, 180 / MM_PER_INCH), facecolor="white")
+    w, h = 0.39, 0.195
+    extent_ab = (60, 180, -20, 40)
+    ax_a = map_axes(
+        fig,
+        (0.08, 0.68, w, h),
+        extent_ab,
+        [60, 90, 120, 150, 180],
+        [-20, -10, 0, 10, 20, 30, 40],
+        "(a) 200-hPa velocity potential and divergent wind",
+    )
+    ax_b = map_axes(
+        fig,
+        (0.53, 0.68, w, h),
+        extent_ab,
+        [60, 90, 120, 150, 180],
+        [-20, -10, 0, 10, 20, 30, 40],
+        "(b) 850-hPa streamfunction and rotational wind",
+    )
+    levels_psi = np.linspace(-1.2e7, 1.2e7, 13)
+    cmap_psi = mpl.colormaps["RdBu_r"]
+    im_a = ax_a.contourf(
+        fields["chi"].lon,
+        fields["chi"].lat,
+        fields["chi"],
+        levels=levels_psi,
+        cmap=cmap_psi,
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    q_a = quiver_on_map(
+        ax_a, fields["divergent_u200"], fields["divergent_v200"], extent_ab
+    )
+    add_quiver_key(ax_a, q_a)
+    add_significance_dots(ax_a, p["chi"], extent_ab)
+    draw_region_box(ax_a, TIO_REGION, "#168143", linewidth=1.0)
+    draw_region_box(ax_a, WNPAC_REGION, "#a32f33", linestyle="--", linewidth=0.85)
+
+    im_b = ax_b.contourf(
+        fields["psi"].lon,
+        fields["psi"].lat,
+        fields["psi"],
+        levels=levels_psi,
+        cmap=cmap_psi,
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    q_b = quiver_on_map(
+        ax_b, fields["rotational_u850"], fields["rotational_v850"], extent_ab
+    )
+    add_quiver_key(ax_b, q_b)
+    add_significance_dots(ax_b, p["psi"], extent_ab)
+    draw_region_box(ax_b, WNPAC_REGION, "#a32f33", linestyle="--", linewidth=1.0)
+
+    add_main_colorbar(
+        fig,
+        im_a,
+        (0.24, 0.615, 0.52, 0.016),
+        "χ₂₀₀ / ψ₈₅₀ (10⁶ m² s⁻¹)",
+        np.linspace(-1.2e7, 1.2e7, 7),
+        ["−12", "−8", "−4", "0", "4", "8", "12"],
+    )
+
+    ax_c = fig.add_axes((0.08, 0.30, w, h))
+    ax_c.set_box_aspect(0.5)
+    ax_c.set_title(
+        "(c) Equatorial zonal-wind anomalies (5°S–5°N)",
+        loc="left",
+        fontsize=7.2,
+        fontweight="bold",
+        pad=3.5,
+    )
+    prof200 = products["profile200_yearly"]
+    prof850 = products["profile850_yearly"]
+    mean200, low200, high200 = confidence_interval(prof200.values)
+    mean850, low850, high850 = confidence_interval(prof850.values)
+    profile_low = min(float(np.nanmin(low200)), float(np.nanmin(low850)))
+    profile_high = max(float(np.nanmax(high200)), float(np.nanmax(high850)))
+    profile_ylim = (
+        min(-2.5, float(np.floor((profile_low - 0.25) * 2) / 2)),
+        max(3.5, float(np.ceil((profile_high + 0.25) * 2) / 2)),
+    )
+    lon = prof200.lon.values
+    ax_c.axvspan(120, 160, color="#f0c94b", alpha=0.11, zorder=0)
+    ax_c.fill_between(lon, low200, high200, color="#c8423e", alpha=0.16, linewidth=0)
+    ax_c.fill_between(lon, low850, high850, color="#1c5a91", alpha=0.14, linewidth=0)
+    ax_c.fill_between(
+        lon,
+        mean200,
+        mean850,
+        where=(mean200 > mean850),
+        color="#c8423e",
+        alpha=0.12,
+        interpolate=True,
+        zorder=1,
+    )
+    ax_c.plot(lon, mean200, color="#bd3936", lw=1.15, label="200 hPa")
+    ax_c.plot(lon, mean850, color="#205a91", lw=1.15, label="850 hPa")
+    ax_c.axhline(0, color="#555555", lw=0.55, ls="--", zorder=0)
+    ax_c.set_xlim(60, 180)
+    ax_c.set_ylim(*profile_ylim)
+    ax_c.set_xticks([60, 80, 100, 120, 140, 160, 180])
+    ax_c.yaxis.set_major_locator(MaxNLocator(6))
+    ax_c.set_xlabel("Longitude (°E)", fontsize=6.2, labelpad=1.5)
+    ax_c.set_ylabel("u anomaly (m s⁻¹)", fontsize=6.2, labelpad=1.5)
+    ax_c.tick_params(labelsize=5.8, pad=1.4)
+    ax_c.legend(
+        loc="upper left",
+        ncol=2,
+        fontsize=5.8,
+        frameon=False,
+        handlelength=1.5,
+        columnspacing=1.0,
+        borderaxespad=0.7,
+    )
+    ax_c.text(
+        0.98,
+        0.80,
+        f"Δu (120–160°E) = {summary['u200_minus_u850_west_pacific_m_s']:.2f} m s⁻¹\n"
+        f"p = {summary['u200_minus_u850_one_sample_p']:.3f}",
+        transform=ax_c.transAxes,
+        ha="right",
+        va="top",
+        fontsize=5.4,
+        color="#303030",
+    )
+
+    extent_d = (100, 180, 10, 50)
+    ax_d = map_axes(
+        fig,
+        (0.53, 0.30, w, h),
+        extent_d,
+        [100, 120, 140, 160, 180],
+        [10, 20, 30, 40, 50],
+        "(d) 500-hPa height anomaly and 5880-gpm contours",
+    )
+    levels_hgt = np.arange(-80, 81, 10)
+    im_d = ax_d.contourf(
+        fields["hgt"].lon,
+        fields["hgt"].lat,
+        fields["hgt"],
+        levels=levels_hgt,
+        cmap="RdBu_r",
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    add_significance_dots(ax_d, p["hgt"], extent_d)
+    clim = subset_region(fields["hgt_clim"], extent_d)
+    warm_abs = subset_region(hgt_abs, extent_d)
+    ax_d.contour(
+        clim.lon,
+        clim.lat,
+        clim,
+        levels=[5880.0],
+        colors=["#1b5f96"],
+        linewidths=1.05,
+        linestyles="--",
+        transform=PROJECTION,
+        zorder=6,
+    )
+    ax_d.contour(
+        warm_abs.lon,
+        warm_abs.lat,
+        warm_abs,
+        levels=[5880.0],
+        colors=["#b93432"],
+        linewidths=1.05,
+        linestyles="-",
+        transform=PROJECTION,
+        zorder=6,
+    )
+    ax_d.legend(
+        handles=[
+            mpl.lines.Line2D([0], [0], color="#1b5f96", lw=1.0, ls="--", label="1981–2010"),
+            mpl.lines.Line2D(
+                [0],
+                [0],
+                color="#b93432",
+                lw=1.0,
+                ls="-",
+                label=f"TIO warm composite (n={len(warm_years)})",
+            ),
+        ],
+        loc="upper left",
+        fontsize=5.2,
+        frameon=True,
+        facecolor="white",
+        edgecolor="#c7c7c7",
+        framealpha=0.92,
+        borderpad=0.3,
+        handlelength=1.6,
+    )
+    add_main_colorbar(
+        fig,
+        im_d,
+        (0.565, 0.235, 0.32, 0.014),
+        "500-hPa height anomaly (gpm)",
+        [-80, -40, 0, 40, 80],
+    )
+
+    fig.text(
+        0.5,
+        0.956,
+        f"JJA warm-year composite, 1979–2020; TIO index > 0.75σ; n = {len(warm_years)}",
+        ha="center",
+        va="center",
+        fontsize=8.0,
+        fontweight="bold",
+    )
+    fig.text(
+        0.08,
+        0.075,
+        "Anomalies use the 1981–2010 JJA climatology. Dots: nominal two-sided one-sample t test, p < 0.05; "
+        "serial dependence and field significance are not corrected. The 5880-gpm line diagnoses a "
+        "geometric contour displacement, not by itself dynamical WPSH intensification.",
+        ha="left",
+        va="center",
+        fontsize=5.5,
+        color="#333333",
+        wrap=True,
+    )
+    fig.text(
+        0.08,
+        0.045,
+        "Framework adapted from Xie et al. (2009). Positive χ indicates convergence; negative χ indicates divergence.",
+        ha="left",
+        va="center",
+        fontsize=5.5,
+        color="#333333",
+    )
+
+    axes = [ax_a, ax_b, ax_c, ax_d]
+    export_figure(
+        fig,
+        output_dir,
+        "Figure_Mechanism_Diagnosis",
+        axes,
+        ["a", "b", "c", "d"],
+        [["a", "b"], ["c", "d"]],
+        [["a", "c"], ["b", "d"]],
+        formats=formats,
+    )
+
+
+def chi_psi_figure(products, output_dir: Path, warm_years: list[int], formats) -> None:
+    fields = products["fields"]
+    p = products["p_fields"]
+    extent = (60, 180, -20, 40)
+    fig = plt.figure(figsize=(180 / MM_PER_INCH, 105 / MM_PER_INCH), facecolor="white")
+    w, h = 0.39, 0.195
+    ax_a = map_axes(
+        fig,
+        (0.08, 0.45, w, 0.32),
+        extent,
+        [60, 90, 120, 150, 180],
+        [-20, -10, 0, 10, 20, 30, 40],
+        "(a) χ₂₀₀ and divergent wind",
+    )
+    ax_b = map_axes(
+        fig,
+        (0.53, 0.45, w, 0.32),
+        extent,
+        [60, 90, 120, 150, 180],
+        [-20, -10, 0, 10, 20, 30, 40],
+        "(b) ψ₈₅₀ and rotational wind",
+    )
+    levels = np.linspace(-1.2e7, 1.2e7, 13)
+    im = None
+    for ax, name in ((ax_a, "chi"), (ax_b, "psi")):
+        im = ax.contourf(
+            fields[name].lon,
+            fields[name].lat,
+            fields[name],
+            levels=levels,
+            cmap="RdBu_r",
+            extend="both",
+            transform=PROJECTION,
+            zorder=1,
+        )
+        add_significance_dots(ax, p[name], extent)
+        draw_region_box(ax, WNPAC_REGION, "#a32f33", linestyle="--", linewidth=0.95)
+    q = quiver_on_map(
+        ax_a, fields["divergent_u200"], fields["divergent_v200"], extent
+    )
+    add_quiver_key(ax_a, q)
+    q = quiver_on_map(
+        ax_b, fields["rotational_u850"], fields["rotational_v850"], extent
+    )
+    add_quiver_key(ax_b, q)
+    draw_region_box(ax_a, TIO_REGION, "#168143", linewidth=1.0)
+    add_main_colorbar(
+        fig,
+        im,
+        (0.24, 0.37, 0.52, 0.02),
+        "Velocity potential / streamfunction (10⁶ m² s⁻¹)",
+        np.linspace(-1.2e7, 1.2e7, 7),
+        ["−12", "−8", "−4", "0", "4", "8", "12"],
+    )
+    fig.text(
+        0.5,
+        0.92,
+        f"TIO warm-year composite (n = {len(warm_years)}); JJA anomalies relative to 1981–2010",
+        ha="center",
+        fontsize=7.5,
+        fontweight="bold",
+    )
+    fig.text(
+        0.08,
+        0.16,
+        "Positive χ indicates convergence; negative χ indicates divergence.\n"
+        "Positive ψ denotes Northern Hemisphere anticyclonic circulation under the adopted convention.",
+        ha="left",
+        fontsize=5.7,
+    )
+    fig.text(
+        0.08,
+        0.12,
+        "Dots indicate nominal p < 0.05; serial dependence and field significance are not corrected.",
+        ha="left",
+        fontsize=5.7,
+    )
+    export_figure(
+        fig,
+        output_dir,
+        "diagnosis_chi_psi",
+        [ax_a, ax_b],
+        ["a", "b"],
+        [["a", "b"]],
+        None,
+        formats=formats,
+    )
+
+
+def step1_figure(products, output_dir: Path, warm_years: list[int], formats) -> None:
+    fields = products["fields"]
+    p = products["p_fields"]
+    fig = plt.figure(figsize=(180 / MM_PER_INCH, 105 / MM_PER_INCH), facecolor="white")
+    w, h = 0.39, 0.195
+    extent_sst = (40, 120, -20, 20)
+    extent_olr = (60, 180, -20, 40)
+    ax_sst = map_axes(
+        fig,
+        (0.08, 0.45, w, 0.32),
+        extent_sst,
+        [40, 60, 80, 100, 120],
+        [-20, -10, 0, 10, 20],
+        "(a) TIO sea-surface temperature anomaly",
+    )
+    ax_olr = map_axes(
+        fig,
+        (0.53, 0.45, w, 0.32),
+        extent_olr,
+        [60, 90, 120, 150, 180],
+        [-20, -10, 0, 10, 20, 30, 40],
+        "(b) Outgoing longwave radiation anomaly",
+    )
+    im_sst = ax_sst.contourf(
+        fields["sst"].lon,
+        fields["sst"].lat,
+        fields["sst"],
+        levels=np.linspace(-1.2, 1.2, 13),
+        cmap="RdBu_r",
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    add_significance_dots(ax_sst, p["sst"], extent_sst)
+    draw_region_box(ax_sst, TIO_REGION, "#168143", linewidth=1.0)
+    im_olr = ax_olr.contourf(
+        fields["olr"].lon,
+        fields["olr"].lat,
+        fields["olr"],
+        levels=np.arange(-12, 13, 2),
+        cmap="RdBu_r",
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    add_significance_dots(ax_olr, p["olr"], extent_olr)
+    draw_region_box(ax_olr, TIO_REGION, "#168143", linewidth=1.0)
+    draw_region_box(ax_olr, WNPAC_REGION, "#a32f33", linestyle="--", linewidth=0.85)
+    add_main_colorbar(
+        fig,
+        im_sst,
+        (0.105, 0.37, 0.34, 0.02),
+        "SST anomaly (°C)",
+        [-1.2, -0.6, 0, 0.6, 1.2],
+    )
+    add_main_colorbar(
+        fig,
+        im_olr,
+        (0.56, 0.37, 0.34, 0.02),
+        "OLR anomaly (W m⁻²; positive = suppressed convection)",
+        [-12, -6, 0, 6, 12],
+    )
+    stats = products["summary"]
+    fig.text(
+        0.5,
+        0.92,
+        f"TIO warm-year composite (n = {len(warm_years)}); JJA anomalies relative to 1981–2010",
+        ha="center",
+        fontsize=7.5,
+        fontweight="bold",
+    )
+    fig.text(
+        0.08,
+        0.16,
+        f"Area-weighted TIO SST anomaly: {stats['tio_sst_warm_composite_c']:+.2f} °C; "
+        f"TIO OLR: {stats['olr_tio_warm_composite_w_m2']:+.2f} W m⁻²; "
+        f"WNPAC-box OLR: {stats['olr_wnpac_warm_composite_w_m2']:+.2f} W m⁻².\n"
+        "OLR is a convection proxy, not a direct atmospheric-heating measurement.",
+        ha="left",
+        fontsize=5.8,
+    )
+    export_figure(
+        fig,
+        output_dir,
+        "step1_tio_heating_diagnosis",
+        [ax_sst, ax_olr],
+        ["a", "b"],
+        [["a", "b"]],
+        None,
+        formats=formats,
+    )
+
+
+def six_panel_figure(products, output_dir: Path, warm_years: list[int], formats) -> None:
+    fields = products["fields"]
+    p = products["p_fields"]
+    hgt_abs = products["hgt_abs_warm"]
+    extent = (60, 180, -20, 40)
+    extent_sst = (40, 120, -20, 20)
+    extent_hgt = (100, 180, 10, 50)
+    fig = plt.figure(figsize=(180 / MM_PER_INCH, 220 / MM_PER_INCH), facecolor="white")
+    w, h = 0.39, 0.16
+    positions = {
+        "a": (0.08, 0.74, w, h),
+        "b": (0.53, 0.74, w, h),
+        "c": (0.08, 0.46, w, h),
+        "d": (0.53, 0.46, w, h),
+        "e": (0.08, 0.18, w, h),
+        "f": (0.53, 0.18, w, h),
+    }
+    ax_a = map_axes(
+        fig,
+        positions["a"],
+        extent_sst,
+        [40, 60, 80, 100, 120],
+        [-20, -10, 0, 10, 20],
+        "(a) TIO SST anomaly",
+    )
+    ax_b = map_axes(
+        fig,
+        positions["b"],
+        extent,
+        [60, 90, 120, 150, 180],
+        [-20, -10, 0, 10, 20, 30, 40],
+        "(b) χ₂₀₀ and divergent wind",
+    )
+    ax_c = fig.add_axes(positions["c"])
+    ax_c.set_box_aspect(0.5)
+    ax_c.set_title("(c) Equatorial u anomaly", loc="left", fontsize=7.2, fontweight="bold", pad=3.5)
+    ax_d = map_axes(
+        fig,
+        positions["d"],
+        extent,
+        [60, 90, 120, 150, 180],
+        [-20, -10, 0, 10, 20, 30, 40],
+        "(d) ψ₈₅₀ and rotational wind",
+    )
+    ax_e = map_axes(
+        fig,
+        positions["e"],
+        extent,
+        [60, 90, 120, 150, 180],
+        [-20, -10, 0, 10, 20, 30, 40],
+        "(e) 850-hPa divergence and wind",
+    )
+    ax_f = map_axes(
+        fig,
+        positions["f"],
+        extent_hgt,
+        [100, 120, 140, 160, 180],
+        [10, 20, 30, 40, 50],
+        "(f) 500-hPa height and 5880-gpm contours",
+    )
+
+    im_a = ax_a.contourf(
+        fields["sst"].lon,
+        fields["sst"].lat,
+        fields["sst"],
+        levels=np.linspace(-1.2, 1.2, 13),
+        cmap="RdBu_r",
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    add_significance_dots(ax_a, p["sst"], extent_sst)
+
+    levels = np.linspace(-1.2e7, 1.2e7, 13)
+    im_b = ax_b.contourf(
+        fields["chi"].lon,
+        fields["chi"].lat,
+        fields["chi"],
+        levels=levels,
+        cmap="RdBu_r",
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    q_b = quiver_on_map(
+        ax_b, fields["divergent_u200"], fields["divergent_v200"], extent
+    )
+    add_quiver_key(ax_b, q_b, x=0.09, y=0.17)
+    add_significance_dots(ax_b, p["chi"], extent)
+    draw_region_box(ax_b, (65.0, 108.0, -15.0, 15.0), "#168143", linewidth=0.9)
+    draw_region_box(ax_b, WNPAC_REGION, "#a32f33", linestyle="--", linewidth=0.8)
+
+    p200 = products["profile200_yearly"]
+    p850 = products["profile850_yearly"]
+    m200, lo200, hi200 = confidence_interval(p200.values)
+    m850, lo850, hi850 = confidence_interval(p850.values)
+    profile_low = min(float(np.nanmin(lo200)), float(np.nanmin(lo850)))
+    profile_high = max(float(np.nanmax(hi200)), float(np.nanmax(hi850)))
+    profile_ylim = (
+        min(-2.5, float(np.floor((profile_low - 0.25) * 2) / 2)),
+        max(3.5, float(np.ceil((profile_high + 0.25) * 2) / 2)),
+    )
+    lon = p200.lon.values
+    ax_c.axvspan(120, 160, color="#f0c94b", alpha=0.11, zorder=0)
+    ax_c.fill_between(lon, lo200, hi200, color="#c8423e", alpha=0.16, linewidth=0)
+    ax_c.fill_between(lon, lo850, hi850, color="#1c5a91", alpha=0.14, linewidth=0)
+    ax_c.fill_between(lon, m200, m850, where=m200 > m850, color="#c8423e", alpha=0.12)
+    ax_c.plot(lon, m200, color="#bd3936", lw=1.0, label="200 hPa")
+    ax_c.plot(lon, m850, color="#205a91", lw=1.0, label="850 hPa")
+    ax_c.axhline(0, color="#555555", lw=0.5, ls="--")
+    ax_c.set_xlim(60, 180)
+    ax_c.set_ylim(*profile_ylim)
+    ax_c.set_xticks([60, 90, 120, 150, 180])
+    ax_c.yaxis.set_major_locator(MaxNLocator(5))
+    ax_c.set_xlabel("Longitude (°E)", fontsize=5.8, labelpad=1)
+    ax_c.set_ylabel("u (m s⁻¹)", fontsize=5.8, labelpad=1)
+    ax_c.tick_params(labelsize=5.2, pad=1)
+    ax_c.legend(
+        loc="upper left",
+        ncol=2,
+        fontsize=5.2,
+        frameon=False,
+        handlelength=1.3,
+        borderaxespad=0.7,
+    )
+
+    im_d = ax_d.contourf(
+        fields["psi"].lon,
+        fields["psi"].lat,
+        fields["psi"],
+        levels=levels,
+        cmap="RdBu_r",
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    q_d = quiver_on_map(
+        ax_d,
+        fields["rotational_u850"],
+        fields["rotational_v850"],
+        extent,
+        stride_lat=3,
+        stride_lon=4,
+        scale=3.0,
+        width=0.0016,
+        headwidth=3.4,
+        headlength=4.1,
+        headaxislength=3.7,
+        alpha=0.88,
+    )
+    add_quiver_key(ax_d, q_d, x=0.09, y=0.17)
+    add_significance_dots(ax_d, p["psi"], extent)
+    draw_region_box(ax_d, WNPAC_REGION, "#a32f33", linestyle="--", linewidth=0.9)
+
+    div_levels = np.linspace(-8e-6, 8e-6, 13)
+    im_e = ax_e.contourf(
+        fields["div850"].lon,
+        fields["div850"].lat,
+        fields["div850"],
+        levels=div_levels,
+        cmap="BrBG",
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    q_e = quiver_on_map(
+        ax_e,
+        fields["u850"],
+        fields["v850"],
+        extent,
+        stride_lat=3,
+        stride_lon=4,
+        scale=3.6,
+        width=0.0015,
+        headwidth=3.2,
+        headlength=3.8,
+        headaxislength=3.4,
+        alpha=0.88,
+    )
+    add_quiver_key(ax_e, q_e, x=0.09, y=0.17)
+    add_significance_dots(ax_e, p["div850"], extent)
+    olr_region = subset_region(fields["olr"], extent)
+    ax_e.contour(
+        olr_region.lon,
+        olr_region.lat,
+        olr_region,
+        levels=[4.0],
+        colors=["#8b2d31"],
+        linewidths=0.75,
+        linestyles="--",
+        transform=PROJECTION,
+        zorder=7,
+    )
+    draw_region_box(ax_e, WNPAC_REGION, "#a32f33", linestyle="--", linewidth=0.8)
+
+    im_f = ax_f.contourf(
+        fields["hgt"].lon,
+        fields["hgt"].lat,
+        fields["hgt"],
+        levels=np.arange(-80, 81, 10),
+        cmap="RdBu_r",
+        extend="both",
+        transform=PROJECTION,
+        zorder=1,
+    )
+    add_significance_dots(ax_f, p["hgt"], extent_hgt)
+    clim = subset_region(fields["hgt_clim"], extent_hgt)
+    warm_abs = subset_region(hgt_abs, extent_hgt)
+    ax_f.contour(
+        clim.lon,
+        clim.lat,
+        clim,
+        levels=[5880.0],
+        colors=["#1b5f96"],
+        linewidths=0.85,
+        linestyles="--",
+        transform=PROJECTION,
+        zorder=6,
+    )
+    ax_f.contour(
+        warm_abs.lon,
+        warm_abs.lat,
+        warm_abs,
+        levels=[5880.0],
+        colors=["#b93432"],
+        linewidths=0.85,
+        transform=PROJECTION,
+        zorder=6,
+    )
+
+    add_main_colorbar(fig, im_a, (0.105, 0.69, 0.34, 0.014), "SST (°C)", [-1.2, -0.6, 0, 0.6, 1.2])
+    add_main_colorbar(
+        fig,
+        im_b,
+        (0.565, 0.69, 0.32, 0.014),
+        "χ₂₀₀ (10⁶ m² s⁻¹)",
+        np.linspace(-1.2e7, 1.2e7, 5),
+        ["−12", "−6", "0", "6", "12"],
+    )
+    add_main_colorbar(
+        fig,
+        im_d,
+        (0.565, 0.41, 0.32, 0.014),
+        "ψ₈₅₀ (10⁶ m² s⁻¹)",
+        np.linspace(-1.2e7, 1.2e7, 5),
+        ["−12", "−6", "0", "6", "12"],
+    )
+    add_main_colorbar(
+        fig,
+        im_e,
+        (0.105, 0.13, 0.34, 0.014),
+        "850-hPa divergence (10⁻⁶ s⁻¹)",
+        np.linspace(-8e-6, 8e-6, 5),
+        ["−8", "−4", "0", "4", "8"],
+    )
+    add_main_colorbar(
+        fig,
+        im_f,
+        (0.565, 0.13, 0.32, 0.014),
+        "500-hPa height anomaly (gpm)",
+        [-80, -40, 0, 40, 80],
+    )
+    fig.text(
+        0.5,
+        0.96,
+        f"TIO warm-year mechanism diagnosis (1979–2020; n = {len(warm_years)})",
+        ha="center",
+        fontsize=8,
+        fontweight="bold",
+    )
+    fig.text(
+        0.08,
+        0.045,
+        "Contours in (e): OLR anomaly = +4 W m⁻². Dots: nominal p < 0.05; no serial-dependence or field-significance correction.\n"
+        "Positive χ indicates convergence; 5880-gpm displacement is geometric.",
+        fontsize=5.3,
+        color="#333333",
+    )
+    axes = [ax_a, ax_b, ax_c, ax_d, ax_e, ax_f]
+    export_figure(
+        fig,
+        output_dir,
+        "complete_mechanism_diagnosis_6panel",
+        axes,
+        ["a", "b", "c", "d", "e", "f"],
+        [["a", "b"], ["c", "d"], ["e", "f"]],
+        [["a", "c", "e"], ["b", "d", "f"]],
+        formats=formats,
+    )
+
+
+def write_caption(output_dir: Path, warm_years: list[int], summary: dict) -> None:
+    caption = (
+        "Figure. TIO warm-year atmospheric response during JJA. (a) 200-hPa velocity "
+        "potential χ and divergent wind. (b) 850-hPa streamfunction ψ and rotational "
+        "wind. (c) Equatorial zonal-wind anomalies averaged over 5°S–5°N; lines show "
+        "warm-year means and bands show 95% t confidence intervals across years. "
+        "(d) 500-hPa geopotential-height anomaly, with the 5880-gpm climatological "
+        "(blue dashed) and warm-composite (red solid) contours. Warm years are defined "
+        "as standardized TIO_JJA > 0.75σ during 1979–2020 (n="
+        f"{len(warm_years)}: {', '.join(str(y) for y in warm_years)}); anomalies use "
+        "the 1981–2010 JJA climatology. Stippling denotes nominal two-sided one-sample "
+        "t-test p<0.05 and is not adjusted for serial dependence or field significance. "
+        "The 5880-gpm line measures geometric contour displacement and does not alone "
+        "establish dynamical WPSH intensification. The WNP-equatorial baroclinic wind "
+        "index (u200-u850, 120–160°E) is "
+        f"{summary['u200_minus_u850_west_pacific_m_s']:.2f} m s⁻¹ "
+        f"(p={summary['u200_minus_u850_one_sample_p']:.3f}); the warm-composite "
+        "5880-gpm west-edge shift relative to climatology is "
+        f"{summary['hgt500_5880_geometric_shift_deg_e']:.2f}° longitude. "
+        "Framework adapted from Xie et al. (2009)."
+    )
+    (output_dir / "Figure_Mechanism_Diagnosis_caption.txt").write_text(
+        caption + "\n", encoding="utf-8"
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    if args.dependency_dir:
+        sys.path.insert(0, str(args.dependency_dir.resolve()))
+    data_dir = args.data_dir.resolve()
+    output_dir = args.output_dir.resolve()
+    required_files = (
+        "HadISST_sst.nc",
+        "ncep.uwnd.mon.mean.nc",
+        "ncep.vwnd.mon.mean.nc",
+        "ncep.hgt.mon.mean.nc",
+        "noaa.olr.mon.mean.nc",
+        "TIO_JJA.csv",
+    )
+    missing = [name for name in required_files if not (data_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing required input files in {data_dir}: {', '.join(missing)}"
+        )
+    warm_years, warm_index = warm_years_from_index(
+        data_dir,
+        args.year_start,
+        args.year_end,
+        args.warm_threshold,
+    )
+    print(f"Warm years (n={len(warm_years)}): {warm_years}")
+    print("Loading 200/850-hPa wind anomalies and computing spherical diagnostics...")
+    data = run_vector_diagnostics(
+        data_dir,
+        warm_years,
+        args.year_start,
+        args.year_end,
+        args.clim_start,
+        args.clim_end,
+    )
+    print("Loading SST, OLR and 500-hPa height composites...")
+    products = make_products(
+        data_dir,
+        output_dir,
+        warm_years,
+        warm_index,
+        data,
+        (args.year_start, args.year_end),
+        (args.clim_start, args.clim_end),
+    )
+    formats = ("png", "pdf", "svg", "tif")
+    print("Rendering four-panel publication figure...")
+    main_figure(products, output_dir, warm_years, formats)
+    print("Rendering velocity-potential/streamfunction and Step 1 figures...")
+    chi_psi_figure(products, output_dir, warm_years, ("png", "pdf", "svg"))
+    step1_figure(products, output_dir, warm_years, ("png", "pdf", "svg"))
+    print("Rendering complete six-panel evidence figure...")
+    six_panel_figure(products, output_dir, warm_years, ("png", "pdf", "svg"))
+    write_caption(output_dir, warm_years, products["summary"])
+    print(f"Outputs written to {output_dir}")
+    print("Summary:")
+    for key, value in products["summary"].items():
+        print(f"  {key}: {value}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
