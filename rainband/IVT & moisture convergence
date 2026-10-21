@@ -1,0 +1,984 @@
+# -*- coding: utf-8 -*-
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+
+from scipy import signal
+from scipy.stats import linregress
+from scipy.ndimage import gaussian_filter
+
+import cartopy.crs as ccrs
+from cartopy.io import shapereader
+from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
+from matplotlib.patches import Rectangle
+
+
+# ============================================================
+# 1. 基本设置
+# ============================================================
+
+pre_file = r"D:\data\pre_yearly_1961-2023.nc"
+wri_file = r"C:\Users\DELL\Desktop\WRP_WRI_41_49_1961_2020_keep2016.xlsx"
+uvq_file = r"E:\data\JRA55_uvq_merged_1961_2020\JRA55_uvq_1961_2020_pentad41_49_mean.nc"
+
+out_dir = r"C:\Users\DELL\Desktop\answer\WRI_moisture_convergence_regression_regions"
+os.makedirs(out_dir, exist_ok=True)
+
+CHINA_SHP_PATH = r"C:\Users\DELL\Desktop\Chinashp\China.shp"
+
+USE_DETRENDED = True
+
+YEAR_START = 1961
+YEAR_END = 2020
+
+MAP_EXTENT = [85, 140, 15, 55]
+COLORBAR_STAT_EXTENT = [85, 140, 30, 55]
+
+PENTAD_GROUPS = {
+    "P44_46": [44, 45, 46],
+    "P47_49": [47, 48, 49],
+}
+
+REGIONS = {
+    "North_35N": [95, 130, 35, 50],
+    "NW":        [95, 110, 35, 45],
+    "NC":        [110, 122, 35, 43],
+    "NE":        [118, 135, 40, 55],
+}
+
+DRAW_REGION_BOXES = True
+
+REGION_BOXES_TO_DRAW = {
+    "NW": [95, 110, 35, 45],
+    "NC": [110, 122, 35, 43],
+    "NE": [118, 135, 40, 55],
+}
+
+FLUX_LEVELS = [1000.0, 925.0, 850.0, 700.0]
+
+QUIVER_SKIP = 3
+QUIVER_SCALE = 520
+QUIVER_WIDTH = 0.0016
+QUIVER_KEY_VALUE = 60
+FLUX_VECTOR_PERCENTILE = 35
+
+SMOOTH_FLUX = True
+SMOOTH_CONV = True
+SMOOTH_SIGMA = 1.0
+
+DRAW_PRECIP_CONTOUR = True
+PRECIP_CONTOUR_LEVEL = 4.0
+
+proj = ccrs.PlateCarree()
+
+plt.rcParams["font.sans-serif"] = ["Arial", "Microsoft YaHei", "SimHei"]
+plt.rcParams["axes.unicode_minus"] = False
+
+
+# ============================================================
+# 2. 读取降水数据
+# ============================================================
+
+ds_pre = xr.open_dataset(pre_file)
+
+if "pre" in ds_pre.data_vars:
+    pre_name = "pre"
+elif "precip" in ds_pre.data_vars:
+    pre_name = "precip"
+elif "pr" in ds_pre.data_vars:
+    pre_name = "pr"
+else:
+    pre_name = list(ds_pre.data_vars)[0]
+
+pre = ds_pre[pre_name].transpose("year", "pentad", "lat", "lon")
+
+years_pre = pre["year"].values.astype(int)
+pentads_pre = pre["pentad"].values.astype(int)
+lats_pre = pre["lat"].values
+lons_pre = pre["lon"].values
+
+lon2d_pre, lat2d_pre = np.meshgrid(lons_pre, lats_pre)
+
+print("降水变量：", pre_name)
+print("降水维度：", pre.shape)
+print("降水年份：", years_pre.min(), years_pre.max())
+print("降水候：", pentads_pre.min(), pentads_pre.max())
+
+
+# ============================================================
+# 3. 读取 UVQ 数据
+# ============================================================
+
+ds_uvq = xr.open_dataset(uvq_file)
+
+u = ds_uvq["u"].transpose("year", "pentad", "level", "lat", "lon")
+v = ds_uvq["v"].transpose("year", "pentad", "level", "lat", "lon")
+q = ds_uvq["q"].transpose("year", "pentad", "level", "lat", "lon")
+
+years_uvq = u["year"].values.astype(int)
+pentads_uvq = u["pentad"].values.astype(int)
+levels_uvq = u["level"].values.astype(float)
+lats_uvq = u["lat"].values
+lons_uvq = u["lon"].values
+
+lon2d_uvq, lat2d_uvq = np.meshgrid(lons_uvq, lats_uvq)
+
+print("\nUVQ 年份：", years_uvq.min(), years_uvq.max())
+print("UVQ 候：", pentads_uvq.min(), pentads_uvq.max())
+print("UVQ 层次：", levels_uvq)
+
+
+# ============================================================
+# 4. 自动读取 WRI Excel
+# ============================================================
+
+def read_wri_excel_auto(wri_file, pre_years, year_start=1961, year_end=2020):
+    xls = pd.ExcelFile(wri_file)
+    best = None
+
+    print("\nWRI Excel 包含的 sheet：", xls.sheet_names)
+
+    for sheet in xls.sheet_names:
+        raw = pd.read_excel(wri_file, sheet_name=sheet, header=None)
+        nrow, ncol = raw.shape
+
+        for iy_col in range(ncol):
+
+            year_num = pd.to_numeric(raw.iloc[:, iy_col], errors="coerce")
+
+            year_like = (
+                year_num.notna() &
+                (year_num >= year_start) &
+                (year_num <= year_end) &
+                (np.abs(year_num - np.round(year_num)) < 1e-6)
+            )
+
+            if year_like.sum() < 20:
+                continue
+
+            for iw_col in range(ncol):
+
+                if iw_col == iy_col:
+                    continue
+
+                wri_num = pd.to_numeric(raw.iloc[:, iw_col], errors="coerce")
+                valid = year_like & wri_num.notna()
+
+                if valid.sum() < 20:
+                    continue
+
+                tmp = pd.DataFrame({
+                    "year": year_num[valid].astype(int).values,
+                    "WRI": wri_num[valid].astype(float).values
+                })
+
+                tmp = tmp.drop_duplicates(subset=["year"], keep="first")
+                tmp = tmp.sort_values("year").reset_index(drop=True)
+
+                overlap_years = sorted(
+                    list(
+                        set(tmp["year"].values)
+                        .intersection(set(pre_years))
+                        .intersection(set(np.arange(year_start, year_end + 1)))
+                    )
+                )
+
+                score = len(overlap_years)
+
+                first_valid_row = np.where(valid.values)[0][0]
+                header_start = max(0, first_valid_row - 8)
+                header_end = first_valid_row
+
+                try:
+                    header_cells = raw.iloc[header_start:header_end, iw_col].astype(str).values
+                    header_text = " ".join(header_cells)
+                except Exception:
+                    header_text = ""
+
+                header_lower = header_text.lower()
+
+                if "wri_std" in header_lower:
+                    score += 300
+                elif "wri" in header_lower:
+                    score += 200
+                elif "index" in header_lower:
+                    score += 50
+
+                if ("lon" in header_lower) or ("longitude" in header_lower) or ("经度" in header_lower):
+                    score -= 100
+
+                candidate = {
+                    "score": score,
+                    "sheet": sheet,
+                    "year_col": iy_col,
+                    "wri_col": iw_col,
+                    "data": tmp,
+                    "overlap_years": overlap_years,
+                    "header_text": header_text,
+                }
+
+                if best is None or candidate["score"] > best["score"]:
+                    best = candidate
+
+    if best is None:
+        raise ValueError("没有在 WRI Excel 中找到可用的年份列和 WRI 数值列。")
+
+    wri_df = best["data"].copy()
+
+    print("\n========== WRI 自动识别结果 ==========")
+    print("使用 sheet:", best["sheet"])
+    print("年份列位置:", best["year_col"])
+    print("WRI 列位置:", best["wri_col"])
+    print("疑似表头文字:", best["header_text"])
+    print("共同年份数量:", len(best["overlap_years"]))
+    print(wri_df.head())
+    print(wri_df.tail())
+
+    return wri_df
+
+
+wri_df = read_wri_excel_auto(
+    wri_file=wri_file,
+    pre_years=years_pre,
+    year_start=YEAR_START,
+    year_end=YEAR_END
+)
+
+
+# ============================================================
+# 5. 匹配共同年份
+# ============================================================
+
+common_years = sorted(
+    list(
+        set(years_pre)
+        .intersection(set(years_uvq))
+        .intersection(set(wri_df["year"].values))
+        .intersection(set(np.arange(YEAR_START, YEAR_END + 1)))
+    )
+)
+
+common_years = np.array(common_years, dtype=int)
+
+print("\n共同年份数量：", len(common_years))
+
+if len(common_years) == 0:
+    raise ValueError("共同年份为 0，请检查降水、UVQ 和 WRI 年份是否一致。")
+
+print("共同年份范围：", common_years.min(), common_years.max())
+
+pre_common = pre.sel(year=common_years)
+u_common = u.sel(year=common_years)
+v_common = v.sel(year=common_years)
+q_common = q.sel(year=common_years)
+
+wri_common = (
+    wri_df.set_index("year")
+    .loc[common_years, "WRI"]
+    .values
+    .astype(float)
+)
+
+
+# ============================================================
+# 6. 标准化 / 去趋势 WRI
+# ============================================================
+
+def standardize_1d(x):
+    x = np.asarray(x, dtype=float)
+    return (x - np.nanmean(x)) / np.nanstd(x)
+
+
+if USE_DETRENDED:
+    wri_for_reg = signal.detrend(wri_common, type="linear")
+    wri_for_reg = standardize_1d(wri_for_reg)
+    suffix = "detrended"
+    print("\n当前使用：去趋势并标准化后的 WRI")
+else:
+    wri_for_reg = standardize_1d(wri_common)
+    suffix = "raw"
+    print("\n当前使用：原始标准化 WRI")
+
+print("回归用 WRI 均值：", np.nanmean(wri_for_reg))
+print("回归用 WRI 标准差：", np.nanstd(wri_for_reg))
+
+
+# ============================================================
+# 7. 工具函数
+# ============================================================
+
+def detrend_3d_by_year(data3d):
+    arr = np.asarray(data3d, dtype=float)
+    nt, ny, nx = arr.shape
+
+    arr2 = arr.reshape(nt, ny * nx)
+    out2 = np.full_like(arr2, np.nan, dtype=float)
+
+    t = np.arange(nt)
+
+    for i in range(ny * nx):
+        y = arr2[:, i]
+        valid = np.isfinite(y)
+
+        if valid.sum() >= int(nt * 0.8):
+            coef = np.polyfit(t[valid], y[valid], 1)
+            trend = coef[0] * t + coef[1]
+            out2[:, i] = y - trend
+
+    return out2.reshape(nt, ny, nx)
+
+
+def regress_grid(y3d, x1d):
+    y3d = np.asarray(y3d, dtype=float)
+    x1d = np.asarray(x1d, dtype=float)
+
+    nt, ny, nx = y3d.shape
+
+    beta = np.full((ny, nx), np.nan)
+    rmap = np.full((ny, nx), np.nan)
+    pmap = np.full((ny, nx), np.nan)
+
+    for iy in range(ny):
+        for ix in range(nx):
+            y = y3d[:, iy, ix]
+            valid = np.isfinite(y) & np.isfinite(x1d)
+
+            if valid.sum() >= 15:
+                res = linregress(x1d[valid], y[valid])
+                beta[iy, ix] = res.slope
+                rmap[iy, ix] = res.rvalue
+                pmap[iy, ix] = res.pvalue
+
+    return beta, rmap, pmap
+
+
+def vertical_integrated_moisture_flux(u_da, v_da, q_da, levels_use):
+    g = 9.80665
+
+    u_sel = u_da.sel(level=levels_use)
+    v_sel = v_da.sel(level=levels_use)
+    q_sel = q_da.sel(level=levels_use)
+
+    u_sel = u_sel.sortby("level", ascending=False)
+    v_sel = v_sel.sortby("level", ascending=False)
+    q_sel = q_sel.sortby("level", ascending=False)
+
+    p_pa = u_sel["level"].values.astype(float) * 100.0
+
+    qu = q_sel.values.astype(float) * u_sel.values.astype(float)
+    qv = q_sel.values.astype(float) * v_sel.values.astype(float)
+
+    p_inc = p_pa[::-1]
+    qu_inc = qu[:, ::-1, :, :]
+    qv_inc = qv[:, ::-1, :, :]
+
+    ivtu = np.trapz(qu_inc, p_inc, axis=1) / g
+    ivtv = np.trapz(qv_inc, p_inc, axis=1) / g
+
+    return ivtu, ivtv
+
+
+def calc_divergence_sphere(fx, fy, lats, lons):
+    a = 6.371e6
+
+    fx = np.asarray(fx, dtype=float)
+    fy = np.asarray(fy, dtype=float)
+
+    lat_rad = np.deg2rad(lats)
+    lon_rad = np.deg2rad(lons)
+
+    coslat = np.cos(lat_rad)
+    coslat_3d = coslat[None, :, None]
+
+    dfx_dlon = np.gradient(fx, lon_rad, axis=2, edge_order=2)
+    dfy_dlat = np.gradient(fy, lat_rad, axis=1, edge_order=2)
+
+    div = dfx_dlon / (a * coslat_3d) + dfy_dlat / a
+
+    return div
+
+
+def smooth_field(field, sigma=1.0):
+    out = field.copy()
+    valid = np.isfinite(out)
+
+    if valid.sum() == 0:
+        return out
+
+    fill_value = np.nanmean(out)
+    tmp = np.where(valid, out, fill_value)
+    sm = gaussian_filter(tmp, sigma=sigma)
+
+    sm[~valid] = np.nan
+
+    return sm
+
+
+def add_china_boundary(ax):
+    if os.path.exists(CHINA_SHP_PATH):
+        reader = shapereader.Reader(CHINA_SHP_PATH)
+        geoms = list(reader.geometries())
+        ax.add_geometries(
+            geoms,
+            crs=proj,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=0.6,
+            zorder=8
+        )
+
+
+def add_region_boxes(ax, add_label=True):
+    if not DRAW_REGION_BOXES:
+        return
+
+    for name, box in REGION_BOXES_TO_DRAW.items():
+        lon_min, lon_max, lat_min, lat_max = box
+
+        rect = Rectangle(
+            (lon_min, lat_min),
+            lon_max - lon_min,
+            lat_max - lat_min,
+            linewidth=0.85,
+            edgecolor="black",
+            facecolor="none",
+            linestyle="--",
+            alpha=0.70,
+            transform=proj,
+            zorder=9
+        )
+
+        ax.add_patch(rect)
+
+        if add_label:
+            ax.text(
+                lon_min + 0.5,
+                lat_max - 1.4,
+                name,
+                fontsize=7.5,
+                fontweight="bold",
+                color="black",
+                alpha=0.85,
+                transform=proj,
+                zorder=10
+            )
+
+
+def setup_map(ax, add_label=True):
+    ax.set_extent(MAP_EXTENT, crs=proj)
+
+    add_china_boundary(ax)
+    add_region_boxes(ax, add_label=add_label)
+
+    ax.set_xticks(np.arange(90, 141, 10), crs=proj)
+    ax.set_yticks(np.arange(15, 56, 5), crs=proj)
+
+    ax.xaxis.set_major_formatter(LongitudeFormatter())
+    ax.yaxis.set_major_formatter(LatitudeFormatter())
+
+    ax.tick_params(labelsize=11)
+    ax.spines["geo"].set_linewidth(0.8)
+
+
+# ============================================================
+# 8. 计算降水、水汽输送和水汽辐合对 WRI 的回归
+# ============================================================
+
+results = {}
+
+for group_name, pentad_list in PENTAD_GROUPS.items():
+
+    print("\n正在处理：", group_name, pentad_list)
+
+    pentad_list_pre = [p for p in pentad_list if p in pentads_pre]
+    pentad_list_uvq = [p for p in pentad_list if p in pentads_uvq]
+
+    if len(pentad_list_pre) == 0:
+        raise ValueError(f"降水数据中不存在候段：{pentad_list}")
+
+    if len(pentad_list_uvq) == 0:
+        raise ValueError(f"UVQ 数据中不存在候段：{pentad_list}")
+
+    pre_group = pre_common.sel(pentad=pentad_list_pre).sum(dim="pentad")
+    pre_values = pre_group.values.astype(float)
+
+    pre_ano = pre_values - np.nanmean(pre_values, axis=0)
+
+    if USE_DETRENDED:
+        pre_reg_input = detrend_3d_by_year(pre_ano)
+    else:
+        pre_reg_input = pre_ano
+
+    pre_beta, pre_r, pre_p = regress_grid(pre_reg_input, wri_for_reg)
+
+    u_group = u_common.sel(pentad=pentad_list_uvq).mean(dim="pentad")
+    v_group = v_common.sel(pentad=pentad_list_uvq).mean(dim="pentad")
+    q_group = q_common.sel(pentad=pentad_list_uvq).mean(dim="pentad")
+
+    ivtu, ivtv = vertical_integrated_moisture_flux(
+        u_da=u_group,
+        v_da=v_group,
+        q_da=q_group,
+        levels_use=FLUX_LEVELS
+    )
+
+    ivtu_ano = ivtu - np.nanmean(ivtu, axis=0)
+    ivtv_ano = ivtv - np.nanmean(ivtv, axis=0)
+
+    if USE_DETRENDED:
+        ivtu_reg_input = detrend_3d_by_year(ivtu_ano)
+        ivtv_reg_input = detrend_3d_by_year(ivtv_ano)
+    else:
+        ivtu_reg_input = ivtu_ano
+        ivtv_reg_input = ivtv_ano
+
+    ivtu_beta, ivtu_r, ivtu_p = regress_grid(ivtu_reg_input, wri_for_reg)
+    ivtv_beta, ivtv_r, ivtv_p = regress_grid(ivtv_reg_input, wri_for_reg)
+
+    div_ivt = calc_divergence_sphere(
+        fx=ivtu,
+        fy=ivtv,
+        lats=lats_uvq,
+        lons=lons_uvq
+    )
+
+    conv = -div_ivt * 86400.0
+
+    conv_ano = conv - np.nanmean(conv, axis=0)
+
+    if USE_DETRENDED:
+        conv_reg_input = detrend_3d_by_year(conv_ano)
+    else:
+        conv_reg_input = conv_ano
+
+    conv_beta, conv_r, conv_p = regress_grid(conv_reg_input, wri_for_reg)
+
+    if SMOOTH_FLUX:
+        ivtu_plot = smooth_field(ivtu_beta, sigma=SMOOTH_SIGMA)
+        ivtv_plot = smooth_field(ivtv_beta, sigma=SMOOTH_SIGMA)
+    else:
+        ivtu_plot = ivtu_beta
+        ivtv_plot = ivtv_beta
+
+    if SMOOTH_CONV:
+        conv_plot = smooth_field(conv_beta, sigma=SMOOTH_SIGMA)
+    else:
+        conv_plot = conv_beta
+
+    flux_mag_plot = np.sqrt(ivtu_plot ** 2 + ivtv_plot ** 2)
+
+    results[group_name] = {
+        "pre_beta": pre_beta,
+        "pre_r": pre_r,
+        "pre_p": pre_p,
+
+        "ivtu_beta": ivtu_beta,
+        "ivtv_beta": ivtv_beta,
+        "ivtu_plot": ivtu_plot,
+        "ivtv_plot": ivtv_plot,
+        "flux_mag_plot": flux_mag_plot,
+
+        "conv_beta": conv_beta,
+        "conv_r": conv_r,
+        "conv_p": conv_p,
+        "conv_plot": conv_plot,
+    }
+
+    print(group_name, "降水 beta min/max:", np.nanmin(pre_beta), np.nanmax(pre_beta))
+    print(group_name, "水汽辐合 beta min/max:", np.nanmin(conv_beta), np.nanmax(conv_beta))
+    print(group_name, "IVT magnitude max:", np.nanmax(flux_mag_plot))
+
+
+# ============================================================
+# 9. 保存结果
+# ============================================================
+
+ds_out = xr.Dataset(
+    coords={
+        "lat_pre": lats_pre,
+        "lon_pre": lons_pre,
+        "lat_uvq": lats_uvq,
+        "lon_uvq": lons_uvq,
+    }
+)
+
+for group_name in PENTAD_GROUPS.keys():
+
+    ds_out[f"{group_name}_pre_beta"] = (("lat_pre", "lon_pre"), results[group_name]["pre_beta"])
+    ds_out[f"{group_name}_pre_p"] = (("lat_pre", "lon_pre"), results[group_name]["pre_p"])
+
+    ds_out[f"{group_name}_ivtu_beta"] = (("lat_uvq", "lon_uvq"), results[group_name]["ivtu_beta"])
+    ds_out[f"{group_name}_ivtv_beta"] = (("lat_uvq", "lon_uvq"), results[group_name]["ivtv_beta"])
+
+    ds_out[f"{group_name}_conv_beta"] = (("lat_uvq", "lon_uvq"), results[group_name]["conv_beta"])
+    ds_out[f"{group_name}_conv_p"] = (("lat_uvq", "lon_uvq"), results[group_name]["conv_p"])
+
+ds_out.attrs["description"] = "Regional moisture convergence and IVT regressed onto WRI"
+ds_out.attrs["WRI"] = "standardized WRI; detrended = " + str(USE_DETRENDED)
+ds_out.attrs["moisture_flux_unit"] = "kg m-1 s-1 per 1 std WRI"
+ds_out.attrs["moisture_convergence_unit"] = "mm day-1 per 1 std WRI"
+ds_out.attrs["levels"] = str(FLUX_LEVELS)
+ds_out.attrs["regions"] = str(REGIONS)
+
+out_nc = os.path.join(
+    out_dir,
+    f"IVT1000_700_moisture_convergence_regression_onto_WRI_{suffix}_regions.nc"
+)
+
+ds_out.to_netcdf(out_nc)
+
+print("\n结果已保存：", out_nc)
+
+
+# ============================================================
+# 10. 水汽辐合色标范围：根据北方区域确定
+# ============================================================
+
+colorbar_mask_uvq = (
+    (lon2d_uvq >= COLORBAR_STAT_EXTENT[0]) & (lon2d_uvq <= COLORBAR_STAT_EXTENT[1]) &
+    (lat2d_uvq >= COLORBAR_STAT_EXTENT[2]) & (lat2d_uvq <= COLORBAR_STAT_EXTENT[3])
+)
+
+all_abs = []
+
+for group_name in PENTAD_GROUPS.keys():
+    vals = results[group_name]["conv_plot"][colorbar_mask_uvq]
+    vals = vals[np.isfinite(vals)]
+
+    if len(vals) > 0:
+        all_abs.append(np.nanpercentile(np.abs(vals), 98))
+
+if len(all_abs) == 0:
+    vmax_abs = 1.0
+else:
+    vmax_abs = np.nanmax(all_abs)
+
+if vmax_abs <= 0.8:
+    cstep = 0.2
+elif vmax_abs <= 2.0:
+    cstep = 0.5
+elif vmax_abs <= 5.0:
+    cstep = 1.0
+else:
+    cstep = 2.0
+
+vmax_abs = np.ceil(vmax_abs / cstep) * cstep
+
+if vmax_abs < cstep:
+    vmax_abs = cstep
+
+vmin_plot = -vmax_abs
+vmax_plot = vmax_abs
+
+levels = np.linspace(vmin_plot, vmax_plot, 17)
+ticks = np.arange(vmin_plot, vmax_plot + cstep * 0.5, cstep)
+
+print("\n水汽辐合色标范围：", vmin_plot, vmax_plot)
+print("水汽辐合色标刻度：", ticks)
+
+
+# ============================================================
+# 11. 绘图：横向排列 1×2
+# ============================================================
+
+ncols = len(PENTAD_GROUPS)
+
+fig, axes = plt.subplots(
+    1,
+    ncols,
+    figsize=(15.2, 5.8),
+    subplot_kw={"projection": proj},
+    dpi=300
+)
+
+if ncols == 1:
+    axes = [axes]
+else:
+    axes = axes.flatten()
+
+panel_labels = ["(a)", "(b)", "(c)"]
+
+title_names = {
+    "P41_43": "P41–43",
+    "P44_46": "P44–46",
+    "P47_49": "P47–49",
+}
+
+cf = None
+qv_plot = None
+
+for ax, panel_label, group_name in zip(axes, panel_labels, PENTAD_GROUPS.keys()):
+
+    if panel_label == "(a)":
+        setup_map(ax, add_label=True)
+    else:
+        setup_map(ax, add_label=False)
+
+    conv_plot = results[group_name]["conv_plot"]
+    pre_beta = results[group_name]["pre_beta"]
+
+    ivtu_plot = results[group_name]["ivtu_plot"]
+    ivtv_plot = results[group_name]["ivtv_plot"]
+    flux_mag_plot = results[group_name]["flux_mag_plot"]
+
+    cf = ax.contourf(
+        lons_uvq,
+        lats_uvq,
+        conv_plot,
+        levels=levels,
+        cmap="BrBG",
+        extend="both",
+        transform=proj,
+        zorder=1
+    )
+
+    try:
+        ax.contour(
+            lons_uvq,
+            lats_uvq,
+            conv_plot,
+            levels=[0],
+            colors="black",
+            linewidths=0.7,
+            transform=proj,
+            zorder=4
+        )
+    except Exception:
+        pass
+
+    if DRAW_PRECIP_CONTOUR:
+        try:
+            ax.contour(
+                lons_pre,
+                lats_pre,
+                pre_beta,
+                levels=[PRECIP_CONTOUR_LEVEL],
+                colors="black",
+                linewidths=1.2,
+                linestyles="solid",
+                transform=proj,
+                zorder=6
+            )
+        except Exception:
+            pass
+
+    map_mask_uvq = (
+        (lon2d_uvq >= MAP_EXTENT[0]) & (lon2d_uvq <= MAP_EXTENT[1]) &
+        (lat2d_uvq >= MAP_EXTENT[2]) & (lat2d_uvq <= MAP_EXTENT[3])
+    )
+
+    mag_vals = flux_mag_plot[map_mask_uvq]
+    mag_vals = mag_vals[np.isfinite(mag_vals)]
+
+    if len(mag_vals) > 0:
+        flux_threshold = np.nanpercentile(mag_vals, FLUX_VECTOR_PERCENTILE)
+    else:
+        flux_threshold = 0.0
+
+    arrow_mask = (
+        map_mask_uvq &
+        np.isfinite(ivtu_plot) &
+        np.isfinite(ivtv_plot) &
+        (flux_mag_plot >= flux_threshold)
+    )
+
+    u_plot = np.where(arrow_mask, ivtu_plot, np.nan)
+    v_plot = np.where(arrow_mask, ivtv_plot, np.nan)
+
+    skip = QUIVER_SKIP
+
+    qv_plot = ax.quiver(
+        lon2d_uvq[::skip, ::skip],
+        lat2d_uvq[::skip, ::skip],
+        u_plot[::skip, ::skip],
+        v_plot[::skip, ::skip],
+        transform=proj,
+        scale=QUIVER_SCALE,
+        width=QUIVER_WIDTH,
+        headwidth=3.5,
+        headlength=4.2,
+        headaxislength=3.8,
+        color="black",
+        zorder=7
+    )
+
+    ax.set_title(
+        f"{panel_label} {title_names[group_name]}",
+        loc="left",
+        fontsize=14,
+        fontweight="bold",
+        pad=7
+    )
+
+fig.subplots_adjust(
+    left=0.045,
+    right=0.895,
+    top=0.91,
+    bottom=0.16,
+    wspace=0.10
+)
+
+# ------------------------------------------------------------
+# 色标：宽度已改窄
+# ------------------------------------------------------------
+
+cax = fig.add_axes([0.905, 0.25, 0.007, 0.48])
+
+cbar = fig.colorbar(
+    cf,
+    cax=cax,
+    orientation="vertical",
+    ticks=ticks
+)
+
+if cstep < 1:
+    cbar.ax.set_yticklabels([f"{t:.1f}" for t in ticks])
+else:
+    cbar.ax.set_yticklabels([f"{int(t)}" for t in ticks])
+
+cbar.ax.tick_params(labelsize=11)
+cbar.set_label(
+    "Moisture convergence regression\n(mm day$^{-1}$ per 1σ WRI)",
+    fontsize=11,
+    labelpad=8
+)
+
+if qv_plot is not None:
+    axes[-1].quiverkey(
+        qv_plot,
+        X=0.52,
+        Y=-0.16,
+        U=QUIVER_KEY_VALUE,
+        label=f"{QUIVER_KEY_VALUE:g} kg m$^{{-1}}$ s$^{{-1}}$ per 1σ WRI",
+        labelpos="E",
+        coordinates="axes",
+        fontproperties={"size": 10}
+    )
+
+out_png = os.path.join(
+    out_dir,
+    f"IVT1000_700_moisture_convergence_regression_onto_WRI_{suffix}_horizontal_regions_cleanbox_thincbar.png"
+)
+
+plt.savefig(out_png, dpi=600, bbox_inches="tight")
+plt.show()
+
+print("\n水汽辐合机制图已保存：", out_png)
+
+
+# ============================================================
+# 12. 区域机制统计：North_35N、NW、NC、NE
+# ============================================================
+
+regional_rows = []
+
+for group_name in PENTAD_GROUPS.keys():
+
+    pre_beta = results[group_name]["pre_beta"]
+    pre_p = results[group_name]["pre_p"]
+
+    conv_beta = results[group_name]["conv_beta"]
+    conv_p = results[group_name]["conv_p"]
+
+    ivtu_beta = results[group_name]["ivtu_beta"]
+    ivtv_beta = results[group_name]["ivtv_beta"]
+    flux_mag = np.sqrt(ivtu_beta ** 2 + ivtv_beta ** 2)
+
+    for region_name, box in REGIONS.items():
+
+        lon_min, lon_max, lat_min, lat_max = box
+
+        pre_mask = (
+            (lon2d_pre >= lon_min) & (lon2d_pre <= lon_max) &
+            (lat2d_pre >= lat_min) & (lat2d_pre <= lat_max)
+        )
+
+        uvq_mask = (
+            (lon2d_uvq >= lon_min) & (lon2d_uvq <= lon_max) &
+            (lat2d_uvq >= lat_min) & (lat2d_uvq <= lat_max)
+        )
+
+        pre_vals = pre_beta[pre_mask]
+        pre_p_vals = pre_p[pre_mask]
+
+        conv_vals = conv_beta[uvq_mask]
+        conv_p_vals = conv_p[uvq_mask]
+
+        ivtu_vals = ivtu_beta[uvq_mask]
+        ivtv_vals = ivtv_beta[uvq_mask]
+        flux_vals = flux_mag[uvq_mask]
+
+        regional_rows.append({
+            "group": group_name,
+            "region": region_name,
+
+            "precip_beta_mean_mm_per_1std_WRI": np.nanmean(pre_vals),
+            "precip_beta_median_mm_per_1std_WRI": np.nanmedian(pre_vals),
+            "precip_positive_fraction": np.nanmean(pre_vals > 0),
+            "precip_p05_fraction": np.nanmean((pre_p_vals < 0.05) & np.isfinite(pre_p_vals)),
+            "precip_p10_fraction": np.nanmean((pre_p_vals < 0.10) & np.isfinite(pre_p_vals)),
+
+            "moisture_convergence_beta_mean_mm_day_per_1std_WRI": np.nanmean(conv_vals),
+            "moisture_convergence_beta_median_mm_day_per_1std_WRI": np.nanmedian(conv_vals),
+            "moisture_convergence_positive_fraction": np.nanmean(conv_vals > 0),
+            "moisture_convergence_p05_fraction": np.nanmean((conv_p_vals < 0.05) & np.isfinite(conv_p_vals)),
+            "moisture_convergence_p10_fraction": np.nanmean((conv_p_vals < 0.10) & np.isfinite(conv_p_vals)),
+
+            "IVT_u_beta_mean_kg_m-1_s-1_per_1std_WRI": np.nanmean(ivtu_vals),
+            "IVT_v_beta_mean_kg_m-1_s-1_per_1std_WRI": np.nanmean(ivtv_vals),
+            "IVT_magnitude_beta_mean_kg_m-1_s-1_per_1std_WRI": np.nanmean(flux_vals),
+            "IVT_magnitude_beta_median_kg_m-1_s-1_per_1std_WRI": np.nanmedian(flux_vals),
+        })
+
+regional_df = pd.DataFrame(regional_rows)
+
+out_regional_csv = os.path.join(
+    out_dir,
+    f"regional_precip_moisture_convergence_IVT_regression_{suffix}.csv"
+)
+
+regional_df.to_csv(out_regional_csv, index=False, encoding="utf-8-sig")
+
+print("\n区域机制统计结果：")
+print(regional_df)
+
+print("\n区域机制统计结果已保存：", out_regional_csv)
+
+
+# ============================================================
+# 13. 提取重点列
+# ============================================================
+
+key_cols = [
+    "group",
+    "region",
+    "precip_beta_mean_mm_per_1std_WRI",
+    "precip_positive_fraction",
+    "moisture_convergence_beta_mean_mm_day_per_1std_WRI",
+    "moisture_convergence_positive_fraction",
+    "IVT_u_beta_mean_kg_m-1_s-1_per_1std_WRI",
+    "IVT_v_beta_mean_kg_m-1_s-1_per_1std_WRI",
+    "IVT_magnitude_beta_mean_kg_m-1_s-1_per_1std_WRI",
+]
+
+regional_key_df = regional_df[key_cols].copy()
+
+out_key_csv = os.path.join(
+    out_dir,
+    f"regional_key_mechanism_statistics_{suffix}.csv"
+)
+
+regional_key_df.to_csv(out_key_csv, index=False, encoding="utf-8-sig")
+
+print("\n区域机制重点结果：")
+print(regional_key_df)
+
+print("\n区域机制重点结果已保存：", out_key_csv)
+
+print("\n全部完成。")
