@@ -1,0 +1,933 @@
+# -*- coding: utf-8 -*-
+
+"""
+Fig.6  水汽通量辐合归因分解
+
+目的：
+将 1000–700 hPa 水汽通量辐合对 WRI 的响应分解为：
+1. Dynamic contribution       : -∇·(q_clim * V')
+2. Thermodynamic contribution : -∇·(q' * V_clim)
+3. Nonlinear contribution     : -∇·(q' * V')
+
+其中：
+q_clim 表示多年平均比湿；
+V_clim 表示多年平均风场；
+q' 表示比湿异常；
+V' 表示风场异常。
+
+注意：
+本版本已修复 spherical_divergence() 中经纬度维度顺序不一致导致的
+ValueError: distances must match the length of the corresponding dimension。
+"""
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+
+from scipy import signal
+from scipy.stats import linregress
+
+
+# ============================================================
+# 1. 路径设置
+# ============================================================
+
+WRI_FILE = r"C:\Users\DELL\Desktop\WRP_WRI_41_49_1961_2020_keep2016.xlsx"
+
+UVQ_FILE = r"E:\data\JRA55_uvq_merged_1961_2020\JRA55_uvq_1961_2020_pentad41_49_mean.nc"
+
+OUT_DIR = r"D:\answer\WRI_term_decomposition"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+
+# ============================================================
+# 2. 基本参数
+# ============================================================
+
+YEAR_START = 1961
+YEAR_END = 2020
+
+GRAV = 9.80665
+R_EARTH = 6.371e6
+
+PENTAD_GROUPS = {
+    "P44–46": [44, 45, 46],
+    "P47–49": [47, 48, 49],
+}
+
+LEVELS_USED_HPA = [1000, 925, 850, 700]
+
+REGIONS = {
+    "NW": [95, 110, 31, 40],
+    "NC": [110, 122, 35, 43],
+    "NE": [118, 135, 40, 55],
+    "North_35N": [95, 135, 35, 55],
+}
+
+REGION_LABELS = {
+    "NW": "NW",
+    "NC": "NC",
+    "NE": "NE",
+    "North_35N": "North>35°N",
+}
+
+DETREND_WRI = True
+DETREND_SERIES = True
+
+# 作图单位：乘以 1e5
+PLOT_SCALE = 1e5
+
+YLABEL = (
+    r"Moisture flux convergence regression"
+    "\n"
+    r"($10^{-5}$ kg m$^{-2}$ s$^{-1}$ per 1$\sigma$ WRI)"
+)
+
+
+# ============================================================
+# 3. 绘图风格
+# ============================================================
+
+plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["font.sans-serif"] = [
+    "Arial",
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Microsoft YaHei",
+    "SimHei",
+]
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["svg.fonttype"] = "none"
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+
+plt.rcParams["axes.linewidth"] = 0.8
+plt.rcParams["xtick.major.width"] = 0.8
+plt.rcParams["ytick.major.width"] = 0.8
+plt.rcParams["xtick.major.size"] = 3.2
+plt.rcParams["ytick.major.size"] = 3.2
+
+TITLE_FONT = 11
+PANEL_FONT = 12
+LABEL_FONT = 10
+TICK_FONT = 9
+LEGEND_FONT = 9
+
+TERM_COLORS = {
+    "Dynamic": "#4C78A8",
+    "Thermodynamic": "#F58518",
+    "Nonlinear": "#8C8C8C",
+}
+
+
+# ============================================================
+# 4. 工具函数
+# ============================================================
+
+def standardize_1d(x):
+    x = np.asarray(x, dtype=float)
+    return (x - np.nanmean(x)) / np.nanstd(x)
+
+
+def safe_detrend_1d(x):
+    x = np.asarray(x, dtype=float)
+    mask = np.isfinite(x)
+
+    if mask.sum() < 5:
+        raise ValueError("有效样本太少，无法去趋势。")
+
+    out = x.copy()
+    out[mask] = signal.detrend(x[mask], type="linear")
+    return out
+
+
+def read_wri_excel_auto(wri_file, year_start=1961, year_end=2020):
+    xls = pd.ExcelFile(wri_file)
+    best = None
+
+    print("\nWRI Excel sheets:", xls.sheet_names)
+
+    for sheet in xls.sheet_names:
+        raw = pd.read_excel(wri_file, sheet_name=sheet, header=None)
+        nrow, ncol = raw.shape
+
+        for iy_col in range(ncol):
+            year_num = pd.to_numeric(raw.iloc[:, iy_col], errors="coerce")
+
+            year_like = (
+                year_num.notna()
+                & (year_num >= year_start)
+                & (year_num <= year_end)
+                & (np.abs(year_num - np.round(year_num)) < 1e-6)
+            )
+
+            if year_like.sum() < 20:
+                continue
+
+            for iw_col in range(ncol):
+                if iw_col == iy_col:
+                    continue
+
+                wri_num = pd.to_numeric(raw.iloc[:, iw_col], errors="coerce")
+                valid = year_like & wri_num.notna()
+
+                if valid.sum() < 20:
+                    continue
+
+                tmp = pd.DataFrame({
+                    "year": year_num[valid].astype(int).values,
+                    "WRI": wri_num[valid].astype(float).values,
+                })
+
+                tmp = tmp.drop_duplicates(subset=["year"], keep="first")
+                tmp = tmp.sort_values("year").reset_index(drop=True)
+
+                overlap_years = sorted(
+                    list(
+                        set(tmp["year"].values)
+                        .intersection(set(np.arange(year_start, year_end + 1)))
+                    )
+                )
+
+                score = len(overlap_years)
+
+                first_valid_row = np.where(valid.values)[0][0]
+                header_start = max(0, first_valid_row - 8)
+                header_end = first_valid_row
+
+                try:
+                    header_cells = raw.iloc[header_start:header_end, iw_col].astype(str).values
+                    header_text = " ".join(header_cells)
+                except Exception:
+                    header_text = ""
+
+                header_lower = header_text.lower()
+
+                if "wri_std" in header_lower:
+                    score += 300
+                elif "wri" in header_lower:
+                    score += 200
+                elif "index" in header_lower:
+                    score += 50
+
+                if ("lon" in header_lower) or ("longitude" in header_lower) or ("经度" in header_lower):
+                    score -= 100
+
+                candidate = {
+                    "score": score,
+                    "sheet": sheet,
+                    "year_col": iy_col,
+                    "wri_col": iw_col,
+                    "data": tmp,
+                    "header_text": header_text,
+                }
+
+                if best is None or candidate["score"] > best["score"]:
+                    best = candidate
+
+    if best is None:
+        raise ValueError("没有在 WRI Excel 中找到可用的年份列和 WRI 数值列。")
+
+    wri_df = best["data"].copy()
+
+    print("\n========== WRI detected ==========")
+    print("sheet:", best["sheet"])
+    print("year_col:", best["year_col"])
+    print("wri_col:", best["wri_col"])
+    print("header:", best["header_text"])
+    print(wri_df.head())
+    print(wri_df.tail())
+
+    return wri_df
+
+
+def guess_coord_names(ds):
+    names = list(ds.coords) + list(ds.dims)
+
+    def find_one(candidates):
+        for c in candidates:
+            for n in names:
+                if n.lower() == c.lower():
+                    return n
+        return None
+
+    year_name = find_one(["year", "yr", "time_year"])
+    pentad_name = find_one(["pentad", "pentads", "p"])
+    level_name = find_one(["level", "lev", "plev", "pressure", "isobaric"])
+    lat_name = find_one(["lat", "latitude"])
+    lon_name = find_one(["lon", "longitude"])
+
+    return year_name, pentad_name, level_name, lat_name, lon_name
+
+
+def guess_var(ds, candidates):
+    for c in candidates:
+        if c in ds.data_vars:
+            return c
+
+    for v in ds.data_vars:
+        vl = v.lower()
+        for c in candidates:
+            if vl == c.lower():
+                return v
+
+    for v in ds.data_vars:
+        vl = v.lower()
+        for c in candidates:
+            if c.lower() in vl:
+                return v
+
+    return None
+
+
+def sort_latlon(da, lat_name, lon_name):
+    if da[lat_name].values[0] > da[lat_name].values[-1]:
+        da = da.sortby(lat_name)
+
+    if da[lon_name].values[0] > da[lon_name].values[-1]:
+        da = da.sortby(lon_name)
+
+    return da
+
+
+def select_pressure_levels(ds, level_name, target_levels_hpa):
+    lev_vals = ds[level_name].values.astype(float)
+
+    if np.nanmax(lev_vals) > 2000:
+        target_vals = np.array(target_levels_hpa, dtype=float) * 100.0
+    else:
+        target_vals = np.array(target_levels_hpa, dtype=float)
+
+    available = ds[level_name].values.astype(float)
+
+    selected = []
+    for tv in target_vals:
+        idx = np.argmin(np.abs(available - tv))
+        selected.append(ds[level_name].values[idx])
+
+    selected = np.unique(selected)
+
+    print("\nTarget levels hPa:", target_levels_hpa)
+    print("Selected levels in file:", selected)
+
+    return ds.sel({level_name: selected})
+
+
+def get_lat_slice(coord, lat1, lat2):
+    vals = coord.values
+    if vals[0] < vals[-1]:
+        return slice(lat1, lat2)
+    else:
+        return slice(lat2, lat1)
+
+
+def get_lon_slice(coord, lon1, lon2):
+    vals = coord.values
+    if vals[0] < vals[-1]:
+        return slice(lon1, lon2)
+    else:
+        return slice(lon2, lon1)
+
+
+def area_weighted_mean(da, lat_name, lon_name, region):
+    lon1, lon2, lat1, lat2 = region
+
+    sub = da.sel({
+        lon_name: get_lon_slice(da[lon_name], lon1, lon2),
+        lat_name: get_lat_slice(da[lat_name], lat1, lat2),
+    })
+
+    weights = np.cos(np.deg2rad(sub[lat_name]))
+
+    return sub.weighted(weights).mean(dim=[lat_name, lon_name])
+
+
+def vertical_integrate(da, level_name):
+    """
+    对气压层做垂直积分：∫ X dp / g
+
+    说明：
+    1. 会自动按气压层升序排序。
+    2. 如果层次单位是 hPa，则转为 Pa。
+    3. 输出保留原有其他维度顺序。
+    """
+
+    da = da.sortby(level_name)
+
+    p = da[level_name].values.astype(float)
+
+    if np.nanmax(p) < 2000:
+        p = p * 100.0
+
+    axis = da.get_axis_num(level_name)
+
+    arr = np.trapz(da.values, x=p, axis=axis) / GRAV
+
+    out_dims = [d for d in da.dims if d != level_name]
+    out_coords = {d: da.coords[d] for d in out_dims}
+
+    return xr.DataArray(
+        arr,
+        coords=out_coords,
+        dims=out_dims,
+    )
+
+
+def spherical_divergence(fu, fv, lat_name, lon_name):
+    """
+    球面散度：
+    div(F) = 1/(a cosφ) * dFu/dλ + 1/(a cosφ) * d(Fv cosφ)/dφ
+    MFC = -div(F)
+
+    这个版本会强制把维度顺序整理为：
+    [..., lat, lon]
+    避免 np.gradient 维度不匹配。
+    """
+
+    # 先对齐 fu 和 fv
+    fu, fv = xr.align(fu, fv, join="inner")
+
+    # 保证纬度、经度升序
+    if fu[lat_name].values[0] > fu[lat_name].values[-1]:
+        fu = fu.sortby(lat_name)
+        fv = fv.sortby(lat_name)
+
+    if fu[lon_name].values[0] > fu[lon_name].values[-1]:
+        fu = fu.sortby(lon_name)
+        fv = fv.sortby(lon_name)
+
+    # 强制 lat/lon 为最后两维
+    other_dims = [d for d in fu.dims if d not in [lat_name, lon_name]]
+    new_order = other_dims + [lat_name, lon_name]
+
+    fu = fu.transpose(*new_order)
+    fv = fv.transpose(*new_order)
+
+    lat = fu[lat_name].values.astype(float)
+    lon = fu[lon_name].values.astype(float)
+
+    lat_rad = np.deg2rad(lat)
+    lon_rad = np.deg2rad(lon)
+
+    cosphi = np.cos(lat_rad)
+    cosphi = np.where(np.abs(cosphi) < 1e-8, np.nan, cosphi)
+
+    fu_arr = fu.values
+    fv_arr = fv.values
+
+    # 明确检查，避免隐藏错误
+    if fu_arr.shape[-1] != len(lon_rad):
+        raise ValueError(
+            f"经度维度不匹配：fu 最后一维长度={fu_arr.shape[-1]}, "
+            f"lon长度={len(lon_rad)}，fu.dims={fu.dims}"
+        )
+
+    if fu_arr.shape[-2] != len(lat_rad):
+        raise ValueError(
+            f"纬度维度不匹配：fu 倒数第二维长度={fu_arr.shape[-2]}, "
+            f"lat长度={len(lat_rad)}，fu.dims={fu.dims}"
+        )
+
+    # dFu / dλ
+    dFu_dlam = np.gradient(
+        fu_arr,
+        lon_rad,
+        axis=-1,
+        edge_order=2
+    )
+
+    # d(Fv cosφ) / dφ
+    shape = [1] * fv_arr.ndim
+    shape[-2] = len(lat)
+    shape[-1] = 1
+
+    cosphi_nd = cosphi.reshape(shape)
+
+    fv_cos = fv_arr * cosphi_nd
+
+    dFvcos_dphi = np.gradient(
+        fv_cos,
+        lat_rad,
+        axis=-2,
+        edge_order=2
+    )
+
+    div = (dFu_dlam + dFvcos_dphi) / (R_EARTH * cosphi_nd)
+
+    mfc = -div
+
+    out = xr.DataArray(
+        mfc,
+        coords=fu.coords,
+        dims=fu.dims,
+        name="mfc",
+    )
+
+    return out
+
+
+def regress_beta_p_r(y, x, detrend_y=True):
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+
+    mask = np.isfinite(y) & np.isfinite(x)
+
+    y = y[mask]
+    x = x[mask]
+
+    if len(y) < 10:
+        return np.nan, np.nan, np.nan
+
+    if detrend_y:
+        y = safe_detrend_1d(y)
+
+    res = linregress(x, y)
+
+    return res.slope, res.pvalue, res.rvalue
+
+
+# ============================================================
+# 5. 读取 WRI
+# ============================================================
+
+wri_df = read_wri_excel_auto(
+    WRI_FILE,
+    year_start=YEAR_START,
+    year_end=YEAR_END,
+)
+
+years_target = np.arange(YEAR_START, YEAR_END + 1)
+
+wri_df = (
+    wri_df[wri_df["year"].isin(years_target)]
+    .drop_duplicates(subset=["year"], keep="first")
+    .sort_values("year")
+    .reset_index(drop=True)
+)
+
+if len(wri_df) != len(years_target):
+    missing = sorted(list(set(years_target) - set(wri_df["year"].values)))
+    raise ValueError(f"WRI 缺少年份：{missing}")
+
+wri_raw = wri_df["WRI"].values.astype(float)
+
+if DETREND_WRI:
+    wri_used = safe_detrend_1d(wri_raw)
+    wri_used = standardize_1d(wri_used)
+    wri_mode = "detrended_standardized"
+else:
+    wri_used = standardize_1d(wri_raw)
+    wri_mode = "raw_standardized"
+
+print("\nWRI mode:", wri_mode)
+print("WRI mean:", np.mean(wri_used))
+print("WRI std:", np.std(wri_used))
+
+
+# ============================================================
+# 6. 读取 UVQ
+# ============================================================
+
+if not os.path.exists(UVQ_FILE):
+    raise FileNotFoundError(f"找不到 UVQ 文件：\n{UVQ_FILE}")
+
+ds = xr.open_dataset(UVQ_FILE)
+
+print("\n========== UVQ file ==========")
+print(ds)
+print("\nData variables:")
+for vname in ds.data_vars:
+    print("  ", vname)
+
+year_name, pentad_name, level_name, lat_name, lon_name = guess_coord_names(ds)
+
+u_var = guess_var(ds, ["u", "ugrd", "uwnd", "u_component_of_wind"])
+v_var = guess_var(ds, ["v", "vgrd", "vwnd", "v_component_of_wind"])
+q_var = guess_var(ds, ["q", "shum", "specific_humidity"])
+
+print("\n========== Detected names ==========")
+print("year:", year_name)
+print("pentad:", pentad_name)
+print("level:", level_name)
+print("lat:", lat_name)
+print("lon:", lon_name)
+print("u_var:", u_var)
+print("v_var:", v_var)
+print("q_var:", q_var)
+
+if year_name is None or pentad_name is None or level_name is None or lat_name is None or lon_name is None:
+    raise ValueError("UVQ 文件坐标识别不完整。")
+
+if u_var is None or v_var is None or q_var is None:
+    raise ValueError("UVQ 文件中 u/v/q 变量识别不完整。")
+
+need_pentads = sorted(list(set(sum(PENTAD_GROUPS.values(), []))))
+
+ds = ds.sel({year_name: years_target})
+ds = ds.sel({pentad_name: need_pentads})
+ds = select_pressure_levels(ds, level_name, LEVELS_USED_HPA)
+
+u = ds[u_var]
+v = ds[v_var]
+q = ds[q_var]
+
+u = sort_latlon(u, lat_name, lon_name)
+v = sort_latlon(v, lat_name, lon_name)
+q = sort_latlon(q, lat_name, lon_name)
+
+u = u.transpose(year_name, pentad_name, level_name, lat_name, lon_name)
+v = v.transpose(year_name, pentad_name, level_name, lat_name, lon_name)
+q = q.transpose(year_name, pentad_name, level_name, lat_name, lon_name)
+
+print("\nSelected UVQ shape:")
+print("u:", u.shape)
+print("v:", v.shape)
+print("q:", q.shape)
+
+
+# ============================================================
+# 7. 气候态与异常
+# ============================================================
+
+u_clim = u.mean(dim=year_name)
+v_clim = v.mean(dim=year_name)
+q_clim = q.mean(dim=year_name)
+
+u_ano = u - u_clim
+v_ano = v - v_clim
+q_ano = q - q_clim
+
+
+# ============================================================
+# 8. 水汽通量辐合分解
+# ============================================================
+
+print("\nCalculating dynamic contribution...")
+fu_dyn = vertical_integrate(q_clim * u_ano, level_name)
+fv_dyn = vertical_integrate(q_clim * v_ano, level_name)
+mfc_dyn = spherical_divergence(fu_dyn, fv_dyn, lat_name, lon_name)
+
+print("Calculating thermodynamic contribution...")
+fu_therm = vertical_integrate(q_ano * u_clim, level_name)
+fv_therm = vertical_integrate(q_ano * v_clim, level_name)
+mfc_therm = spherical_divergence(fu_therm, fv_therm, lat_name, lon_name)
+
+print("Calculating nonlinear contribution...")
+fu_nl = vertical_integrate(q_ano * u_ano, level_name)
+fv_nl = vertical_integrate(q_ano * v_ano, level_name)
+mfc_nl = spherical_divergence(fu_nl, fv_nl, lat_name, lon_name)
+
+print("Calculating total MFC anomaly for closure check...")
+fu_total = vertical_integrate(q * u, level_name)
+fv_total = vertical_integrate(q * v, level_name)
+mfc_total = spherical_divergence(fu_total, fv_total, lat_name, lon_name)
+
+mfc_total_clim = mfc_total.mean(dim=year_name)
+mfc_total_ano = mfc_total - mfc_total_clim
+
+closure = mfc_dyn + mfc_therm + mfc_nl - mfc_total_ano
+print("Closure check mean:", float(closure.mean(skipna=True).values))
+print("Closure check max abs:", float(np.nanmax(np.abs(closure.values))))
+
+
+# ============================================================
+# 9. 区域平均与回归
+# ============================================================
+
+term_data = {
+    "Dynamic": mfc_dyn,
+    "Thermodynamic": mfc_therm,
+    "Nonlinear": mfc_nl,
+    "Total": mfc_total_ano,
+}
+
+rows = []
+
+for period_name, pentads in PENTAD_GROUPS.items():
+
+    print("\nProcessing:", period_name, pentads)
+
+    for region_name, region_box in REGIONS.items():
+
+        region_values = {}
+
+        for term_name, da_term in term_data.items():
+
+            da_p = da_term.sel({pentad_name: pentads}).mean(dim=pentad_name)
+
+            region_series = area_weighted_mean(
+                da_p,
+                lat_name=lat_name,
+                lon_name=lon_name,
+                region=region_box,
+            )
+
+            beta, pval, rval = regress_beta_p_r(
+                y=region_series.values,
+                x=wri_used,
+                detrend_y=DETREND_SERIES,
+            )
+
+            region_values[term_name] = beta
+
+            rows.append({
+                "period": period_name,
+                "region": region_name,
+                "term": term_name,
+                "beta_raw": beta,
+                "beta_scaled": beta * PLOT_SCALE,
+                "p": pval,
+                "r": rval,
+            })
+
+        sum_three = (
+            region_values["Dynamic"]
+            + region_values["Thermodynamic"]
+            + region_values["Nonlinear"]
+        )
+
+        total = region_values["Total"]
+
+        print(
+            f"{period_name:7s} {region_name:9s} "
+            f"sum3={sum_three:.6e}, total={total:.6e}, diff={sum_three-total:.6e}"
+        )
+
+
+result_df = pd.DataFrame(rows)
+
+out_csv = os.path.join(
+    OUT_DIR,
+    "Fig6_WRI_MFC_term_decomposition_regional_regression.csv",
+)
+
+out_xlsx = os.path.join(
+    OUT_DIR,
+    "Fig6_WRI_MFC_term_decomposition_regional_regression.xlsx",
+)
+
+result_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+result_df.to_excel(out_xlsx, index=False)
+
+print("\nRegression results saved:")
+print(out_csv)
+print(out_xlsx)
+
+
+# ============================================================
+# 10. 绘制柱状图
+# ============================================================
+
+plot_terms = ["Dynamic", "Thermodynamic", "Nonlinear"]
+plot_regions = ["NW", "NC", "NE", "North_35N"]
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(11.0, 4.2),
+    dpi=450,
+    sharey=True,
+)
+
+bar_width = 0.22
+x = np.arange(len(plot_regions))
+
+for i, (ax, period_name) in enumerate(zip(axes, PENTAD_GROUPS.keys())):
+
+    sub = result_df[result_df["period"] == period_name].copy()
+
+    ymax_ref = np.nanmax(np.abs(sub[sub["term"].isin(plot_terms)]["beta_scaled"].values))
+    if not np.isfinite(ymax_ref) or ymax_ref == 0:
+        ymax_ref = 1.0
+
+    for j, term_name in enumerate(plot_terms):
+
+        s = (
+            sub[sub["term"] == term_name]
+            .set_index("region")
+            .loc[plot_regions]
+        )
+
+        vals = s["beta_scaled"].values
+        pvals = s["p"].values
+
+        xpos = x + (j - 1) * bar_width
+
+        ax.bar(
+            xpos,
+            vals,
+            width=bar_width,
+            color=TERM_COLORS[term_name],
+            edgecolor="#2A2A2A",
+            linewidth=0.55,
+            label=term_name if i == 0 else None,
+            zorder=3,
+        )
+
+        for xx, yy, pp in zip(xpos, vals, pvals):
+            if np.isfinite(pp) and pp < 0.05:
+                offset = 0.06 * ymax_ref
+                if yy >= 0:
+                    ax.text(
+                        xx,
+                        yy + offset,
+                        "*",
+                        ha="center",
+                        va="bottom",
+                        fontsize=12,
+                        fontweight="bold",
+                        color="#2A2A2A",
+                        zorder=5,
+                    )
+                else:
+                    ax.text(
+                        xx,
+                        yy - offset,
+                        "*",
+                        ha="center",
+                        va="top",
+                        fontsize=12,
+                        fontweight="bold",
+                        color="#2A2A2A",
+                        zorder=5,
+                    )
+
+    ax.axhline(
+        0,
+        color="#2A2A2A",
+        linewidth=0.75,
+        zorder=2,
+    )
+
+    ax.grid(
+        axis="y",
+        linestyle="-",
+        linewidth=0.45,
+        color="#D9D9D9",
+        zorder=1,
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [REGION_LABELS[r] for r in plot_regions],
+        fontsize=TICK_FONT,
+    )
+
+    ax.tick_params(
+        axis="both",
+        which="major",
+        labelsize=TICK_FONT,
+        length=3.0,
+        width=0.75,
+        pad=2,
+    )
+
+    panel = "(a)" if i == 0 else "(b)"
+
+    ax.set_title(
+        f"{panel} {period_name}",
+        loc="left",
+        fontsize=PANEL_FONT,
+        fontweight="bold",
+        pad=6,
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax.spines["left"].set_linewidth(0.8)
+    ax.spines["bottom"].set_linewidth(0.8)
+
+axes[0].set_ylabel(
+    YLABEL,
+    fontsize=LABEL_FONT,
+)
+
+handles, labels = axes[0].get_legend_handles_labels()
+
+fig.legend(
+    handles,
+    labels,
+    loc="upper center",
+    ncol=3,
+    frameon=False,
+    fontsize=LEGEND_FONT,
+    bbox_to_anchor=(0.52, 0.995),
+    columnspacing=1.4,
+    handlelength=1.8,
+)
+
+fig.subplots_adjust(
+    left=0.085,
+    right=0.985,
+    top=0.84,
+    bottom=0.16,
+    wspace=0.13,
+)
+
+out_png = os.path.join(
+    OUT_DIR,
+    "Fig6_WRI_MFC_term_decomposition_barplot.png",
+)
+
+out_pdf = os.path.join(
+    OUT_DIR,
+    "Fig6_WRI_MFC_term_decomposition_barplot.pdf",
+)
+
+out_svg = os.path.join(
+    OUT_DIR,
+    "Fig6_WRI_MFC_term_decomposition_barplot.svg",
+)
+
+fig.savefig(out_png, dpi=600, bbox_inches="tight")
+fig.savefig(out_pdf, bbox_inches="tight")
+fig.savefig(out_svg, bbox_inches="tight")
+
+plt.show()
+plt.close(fig)
+
+print("\nFigure saved:")
+print(out_png)
+print(out_pdf)
+print(out_svg)
+
+
+# ============================================================
+# 11. 输出透视表
+# ============================================================
+
+pivot = (
+    result_df[result_df["term"].isin(plot_terms)]
+    .pivot_table(
+        index=["period", "region"],
+        columns="term",
+        values="beta_scaled",
+    )
+)
+
+pivot_file = os.path.join(
+    OUT_DIR,
+    "Fig6_WRI_MFC_term_decomposition_pivot.csv",
+)
+
+pivot.to_csv(pivot_file, encoding="utf-8-sig")
+
+print("\nPivot table:")
+print(pivot)
+print("\nPivot table saved:")
+print(pivot_file)
+
+
+# ============================================================
+# 12. 关闭文件
+# ============================================================
+
+ds.close()
+
+print("\n全部完成。")
