@@ -1,0 +1,928 @@
+# -*- coding: utf-8 -*-
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+
+from scipy import signal
+from scipy.stats import t as t_dist
+from scipy.ndimage import gaussian_filter
+
+import cartopy.crs as ccrs
+from cartopy.io import shapereader
+from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
+
+from matplotlib.patches import Rectangle
+from matplotlib.colors import LinearSegmentedColormap
+
+
+# ============================================================
+# 0. Figure contract
+# ============================================================
+
+# Fig. 4:
+#   500 hPa pressure vertical velocity regression onto the
+#   detrended and standardized WRI during P44–46 and P47–49.
+#
+# shading: 500 hPa omega regression
+# gray dashed contour: positive precipitation regression core
+#
+# Negative omega means enhanced upward motion.
+#
+# Output:
+#   SVG / PDF / PNG / source-data NetCDF
+
+
+# ============================================================
+# 1. 路径设置
+# ============================================================
+
+vvel_file = r"D:\jra55w\JRA55_vvel_1961_2020_pentad41_49_500_700hPa.nc"
+
+pre_file = r"D:\data\pre_yearly_1961-2023.nc"
+
+wri_file = r"C:\Users\DELL\Desktop\WRP_WRI_41_49_1961_2020_keep2016.xlsx"
+
+CHINA_SHP_PATH = r"C:\Users\DELL\Desktop\Chinashp\China.shp"
+
+out_dir = r"D:\answer\NatureStyle_FinalFigures\Fig4_omega500_regression"
+os.makedirs(out_dir, exist_ok=True)
+
+
+# ============================================================
+# 2. 分析参数
+# ============================================================
+
+YEAR_START = 1961
+YEAR_END = 2020
+
+USE_DETRENDED_WRI = True
+DETREND_OMEGA = True
+DETREND_PRECIP = True
+
+TARGET_LEVEL = 500
+
+PENTAD_GROUPS = {
+    "P44_46": [44, 45, 46],
+    "P47_49": [47, 48, 49],
+}
+
+PENTAD_LABELS = {
+    "P44_46": "P44–46",
+    "P47_49": "P47–49",
+}
+
+REGION_BOXES = {
+    "NW": [95, 110, 31, 40],
+    "NC": [110, 122, 35, 43],
+    "NE": [118, 135, 40, 55],
+}
+
+MAP_EXTENT = [90, 140, 25, 55]
+
+SMOOTH_FIELD = True
+SMOOTH_SIGMA = 0.75
+
+SIG_P_LEVEL = 0.05
+SIG_SKIP = 4
+
+PRECIP_CORE_LEVEL = 4.0
+
+# omega 乘以 100 后绘图：
+# 原始单位 Pa s^-1 per 1σ WRI
+# 绘图单位 10^-2 Pa s^-1 per 1σ WRI
+OMEGA_SCALE = 100.0
+OMEGA_VMAX = 2.0
+OMEGA_LEVELS = np.linspace(-OMEGA_VMAX, OMEGA_VMAX, 17)
+OMEGA_TICKS = np.arange(-2.0, 2.01, 1.0)
+
+proj = ccrs.PlateCarree()
+
+
+# ============================================================
+# 3. Nature-style 绘图参数
+# ============================================================
+
+plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["font.sans-serif"] = [
+    "Arial",
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Microsoft YaHei",
+    "SimHei",
+]
+plt.rcParams["axes.unicode_minus"] = False
+
+plt.rcParams["svg.fonttype"] = "none"
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
+
+plt.rcParams["font.size"] = 8.3
+plt.rcParams["axes.linewidth"] = 0.60
+plt.rcParams["legend.frameon"] = False
+plt.rcParams["xtick.major.width"] = 0.60
+plt.rcParams["ytick.major.width"] = 0.60
+plt.rcParams["xtick.major.size"] = 2.8
+plt.rcParams["ytick.major.size"] = 2.8
+
+
+PALETTE = {
+    "blue_dark": "#2B6C9F",
+    "blue_mid": "#5E9EC4",
+    "blue_soft": "#A6CEE3",
+    "blue_pale": "#DDECF2",
+    "neutral": "#F8F8F8",
+    "red_pale": "#FCE1D2",
+    "red_soft": "#F5AA8C",
+    "red_mid": "#D86552",
+    "red_dark": "#B2182B",
+    "line_dark": "#2A2A2A",
+    "line_mid": "#8A8A8A",
+    "line_light": "#B8B8B8",
+    "region": "#7A7A7A",
+}
+
+omega_cmap = LinearSegmentedColormap.from_list(
+    "nature_omega_diverging_red_blue",
+    [
+        PALETTE["blue_dark"],
+        PALETTE["blue_mid"],
+        PALETTE["blue_soft"],
+        PALETTE["blue_pale"],
+        PALETTE["neutral"],
+        PALETTE["red_pale"],
+        PALETTE["red_soft"],
+        PALETTE["red_mid"],
+        PALETTE["red_dark"],
+    ],
+    N=256
+)
+
+
+# ============================================================
+# 4. 工具函数
+# ============================================================
+
+def standardize_1d(x):
+    x = np.asarray(x, dtype=float)
+    return (x - np.nanmean(x)) / np.nanstd(x)
+
+
+def read_wri_excel_auto(wri_file, year_start=1961, year_end=2020):
+    xls = pd.ExcelFile(wri_file)
+    best = None
+
+    print("\nWRI Excel sheets:", xls.sheet_names)
+
+    for sheet in xls.sheet_names:
+        raw = pd.read_excel(wri_file, sheet_name=sheet, header=None)
+        nrow, ncol = raw.shape
+
+        for iy_col in range(ncol):
+
+            year_num = pd.to_numeric(raw.iloc[:, iy_col], errors="coerce")
+
+            year_like = (
+                year_num.notna()
+                & (year_num >= year_start)
+                & (year_num <= year_end)
+                & (np.abs(year_num - np.round(year_num)) < 1e-6)
+            )
+
+            if year_like.sum() < 20:
+                continue
+
+            for iw_col in range(ncol):
+
+                if iw_col == iy_col:
+                    continue
+
+                wri_num = pd.to_numeric(raw.iloc[:, iw_col], errors="coerce")
+                valid = year_like & wri_num.notna()
+
+                if valid.sum() < 20:
+                    continue
+
+                tmp = pd.DataFrame({
+                    "year": year_num[valid].astype(int).values,
+                    "WRI": wri_num[valid].astype(float).values
+                })
+
+                tmp = tmp.drop_duplicates(subset=["year"], keep="first")
+                tmp = tmp.sort_values("year").reset_index(drop=True)
+
+                overlap_years = sorted(
+                    list(
+                        set(tmp["year"].values)
+                        .intersection(set(np.arange(year_start, year_end + 1)))
+                    )
+                )
+
+                score = len(overlap_years)
+
+                first_valid_row = np.where(valid.values)[0][0]
+                header_start = max(0, first_valid_row - 8)
+                header_end = first_valid_row
+
+                try:
+                    header_cells = raw.iloc[header_start:header_end, iw_col].astype(str).values
+                    header_text = " ".join(header_cells)
+                except Exception:
+                    header_text = ""
+
+                header_lower = header_text.lower()
+
+                if "wri_std" in header_lower:
+                    score += 300
+                elif "wri" in header_lower:
+                    score += 200
+                elif "index" in header_lower:
+                    score += 50
+
+                if ("lon" in header_lower) or ("longitude" in header_lower) or ("经度" in header_lower):
+                    score -= 100
+
+                candidate = {
+                    "score": score,
+                    "sheet": sheet,
+                    "year_col": iy_col,
+                    "wri_col": iw_col,
+                    "data": tmp,
+                    "header_text": header_text,
+                }
+
+                if best is None or candidate["score"] > best["score"]:
+                    best = candidate
+
+    if best is None:
+        raise ValueError("没有在 WRI Excel 中找到可用的年份列和 WRI 数值列。")
+
+    wri_df = best["data"].copy()
+
+    print("\n========== WRI detected ==========")
+    print("sheet:", best["sheet"])
+    print("year_col:", best["year_col"])
+    print("wri_col:", best["wri_col"])
+    print("header:", best["header_text"])
+    print(wri_df.head())
+    print(wri_df.tail())
+
+    return wri_df
+
+
+def guess_coord_names_common(ds):
+    names = list(ds.coords) + list(ds.dims)
+
+    def find_one(candidates):
+        for c in candidates:
+            for n in names:
+                if n.lower() == c.lower():
+                    return n
+        return None
+
+    year_name = find_one(["year", "yr", "time_year"])
+    pentad_name = find_one(["pentad", "pentads", "p"])
+    level_name = find_one(["level", "lev", "plev", "pressure"])
+    lat_name = find_one(["lat", "latitude"])
+    lon_name = find_one(["lon", "longitude"])
+
+    return year_name, pentad_name, level_name, lat_name, lon_name
+
+
+def guess_precip_coord_names(ds):
+    names = list(ds.coords) + list(ds.dims)
+
+    def find_one(candidates):
+        for c in candidates:
+            for n in names:
+                if n.lower() == c.lower():
+                    return n
+        return None
+
+    year_name = find_one(["year", "yr", "time_year"])
+    pentad_name = find_one(["pentad", "pentads", "p"])
+    lat_name = find_one(["lat", "latitude"])
+    lon_name = find_one(["lon", "longitude"])
+
+    return year_name, pentad_name, lat_name, lon_name
+
+
+def guess_var(ds, candidates):
+    for c in candidates:
+        if c in ds.data_vars:
+            return c
+
+    for v in ds.data_vars:
+        vl = v.lower()
+        for c in candidates:
+            if c.lower() in vl:
+                return v
+
+    return None
+
+
+def guess_precip_var(ds):
+    candidates = ["pre", "precip", "precipitation", "pr", "rain", "rainfall"]
+
+    for c in candidates:
+        if c in ds.data_vars:
+            return c
+
+    for v in ds.data_vars:
+        vl = v.lower()
+        if any(c in vl for c in candidates):
+            return v
+
+    raise ValueError("没有自动识别出降水变量，请手动指定。")
+
+
+def sort_latlon(da, lat_name, lon_name):
+    if da[lat_name].values[0] > da[lat_name].values[-1]:
+        da = da.sortby(lat_name)
+
+    if da[lon_name].values[0] > da[lon_name].values[-1]:
+        da = da.sortby(lon_name)
+
+    return da
+
+
+def detrend_3d_nan(y3d):
+    y = np.asarray(y3d, dtype=float)
+    nt = y.shape[0]
+
+    t = np.arange(nt, dtype=float)
+    t3 = t[:, None, None]
+
+    mask = np.isfinite(y)
+
+    n = np.sum(mask, axis=0)
+
+    sum_t = np.sum(np.where(mask, t3, 0.0), axis=0)
+    sum_y = np.sum(np.where(mask, y, 0.0), axis=0)
+    sum_tt = np.sum(np.where(mask, t3 ** 2, 0.0), axis=0)
+    sum_ty = np.sum(np.where(mask, t3 * y, 0.0), axis=0)
+
+    den = n * sum_tt - sum_t ** 2
+
+    slope = np.full(y.shape[1:], np.nan)
+    intercept = np.full(y.shape[1:], np.nan)
+
+    valid = (n >= 3) & np.isfinite(den) & (np.abs(den) > 1e-12)
+
+    slope[valid] = (
+        n[valid] * sum_ty[valid] - sum_t[valid] * sum_y[valid]
+    ) / den[valid]
+
+    intercept[valid] = (
+        sum_y[valid] - slope[valid] * sum_t[valid]
+    ) / n[valid]
+
+    trend = intercept[None, :, :] + slope[None, :, :] * t3
+
+    out = y - trend
+    out[~mask] = np.nan
+
+    return out
+
+
+def regress_grid(y3d, x1d):
+    y = np.asarray(y3d, dtype=float)
+    x = np.asarray(x1d, dtype=float)
+
+    if y.shape[0] != x.shape[0]:
+        raise ValueError(f"y3d 时间长度 {y.shape[0]} 与 x1d 长度 {x.shape[0]} 不一致。")
+
+    x3 = x[:, None, None]
+
+    mask = np.isfinite(y) & np.isfinite(x3)
+
+    n = np.sum(mask, axis=0)
+
+    sum_x = np.sum(np.where(mask, x3, 0.0), axis=0)
+    sum_y = np.sum(np.where(mask, y, 0.0), axis=0)
+
+    sum_xx = np.sum(np.where(mask, x3 ** 2, 0.0), axis=0)
+    sum_yy = np.sum(np.where(mask, y ** 2, 0.0), axis=0)
+    sum_xy = np.sum(np.where(mask, x3 * y, 0.0), axis=0)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ssxx = sum_xx - sum_x ** 2 / n
+        ssyy = sum_yy - sum_y ** 2 / n
+        ssxy = sum_xy - sum_x * sum_y / n
+
+    beta = np.full(y.shape[1:], np.nan)
+    r = np.full(y.shape[1:], np.nan)
+    p = np.full(y.shape[1:], np.nan)
+
+    valid = (
+        (n >= 5)
+        & np.isfinite(ssxx)
+        & np.isfinite(ssyy)
+        & np.isfinite(ssxy)
+        & (ssxx > 0)
+        & (ssyy > 0)
+    )
+
+    beta[valid] = ssxy[valid] / ssxx[valid]
+
+    r[valid] = ssxy[valid] / np.sqrt(ssxx[valid] * ssyy[valid])
+    r = np.clip(r, -0.999999, 0.999999)
+
+    df = n - 2
+
+    tval = np.full(y.shape[1:], np.nan)
+    tval[valid] = r[valid] * np.sqrt(df[valid] / (1.0 - r[valid] ** 2))
+
+    p[valid] = 2.0 * t_dist.sf(np.abs(tval[valid]), df[valid])
+
+    return beta, r, p
+
+
+def smooth_field(field, sigma=0.75):
+    out = np.asarray(field, dtype=float).copy()
+    valid = np.isfinite(out)
+
+    if valid.sum() == 0:
+        return out
+
+    fill_value = np.nanmean(out)
+    tmp = np.where(valid, out, fill_value)
+    sm = gaussian_filter(tmp, sigma=sigma)
+    sm[~valid] = np.nan
+
+    return sm
+
+
+def add_china_boundary(ax):
+    if os.path.exists(CHINA_SHP_PATH):
+        reader = shapereader.Reader(CHINA_SHP_PATH)
+        geoms = list(reader.geometries())
+
+        ax.add_geometries(
+            geoms,
+            crs=proj,
+            facecolor="none",
+            edgecolor=PALETTE["line_dark"],
+            linewidth=0.42,
+            zorder=20
+        )
+
+
+def add_region_boxes(ax, add_label=True):
+    label_pos = {
+        "NW": (95.6, 38.85),
+        "NC": (110.6, 42.25),
+        "NE": (118.8, 53.85),
+    }
+
+    for name, box in REGION_BOXES.items():
+        lon_min, lon_max, lat_min, lat_max = box
+
+        rect = Rectangle(
+            (lon_min, lat_min),
+            lon_max - lon_min,
+            lat_max - lat_min,
+            linewidth=0.60,
+            edgecolor=PALETTE["region"],
+            facecolor="none",
+            linestyle=(0, (4, 2.2)),
+            alpha=0.82,
+            transform=proj,
+            zorder=30
+        )
+
+        ax.add_patch(rect)
+
+        if add_label:
+            x_text, y_text = label_pos[name]
+
+            ax.text(
+                x_text,
+                y_text,
+                name,
+                fontsize=7.4,
+                fontweight="bold",
+                color=PALETTE["line_dark"],
+                ha="left",
+                va="top",
+                transform=proj,
+                zorder=31
+            )
+
+
+def setup_map(ax, add_region_label=True):
+    ax.set_extent(MAP_EXTENT, crs=proj)
+
+    add_china_boundary(ax)
+    add_region_boxes(ax, add_label=add_region_label)
+
+    xticks = np.arange(90, 141, 10)
+    yticks = np.arange(25, 56, 5)
+
+    ax.set_xticks(xticks, crs=proj)
+    ax.set_yticks(yticks, crs=proj)
+
+    ax.xaxis.set_major_formatter(LongitudeFormatter(number_format=".0f", degree_symbol="°"))
+    ax.yaxis.set_major_formatter(LatitudeFormatter(number_format=".0f", degree_symbol="°"))
+
+    ax.tick_params(
+        axis="both",
+        which="major",
+        labelsize=8.3,
+        length=2.8,
+        width=0.60,
+        pad=2.2
+    )
+
+    ax.spines["geo"].set_linewidth(0.60)
+    ax.spines["geo"].set_edgecolor(PALETTE["line_dark"])
+
+
+# ============================================================
+# 5. 读取 WRI
+# ============================================================
+
+wri_df = read_wri_excel_auto(
+    wri_file=wri_file,
+    year_start=YEAR_START,
+    year_end=YEAR_END
+)
+
+years_target = np.arange(YEAR_START, YEAR_END + 1)
+
+wri_df = (
+    wri_df[wri_df["year"].isin(years_target)]
+    .drop_duplicates(subset=["year"], keep="first")
+    .sort_values("year")
+    .reset_index(drop=True)
+)
+
+if len(wri_df) != len(years_target):
+    missing = sorted(list(set(years_target) - set(wri_df["year"].values)))
+    raise ValueError(f"WRI 缺少年份：{missing}")
+
+wri_raw = wri_df["WRI"].values.astype(float)
+
+if USE_DETRENDED_WRI:
+    wri_for_reg = signal.detrend(wri_raw, type="linear")
+    wri_for_reg = standardize_1d(wri_for_reg)
+    wri_suffix = "detrended"
+else:
+    wri_for_reg = standardize_1d(wri_raw)
+    wri_suffix = "raw"
+
+print("\nWRI mode:", wri_suffix)
+
+
+# ============================================================
+# 6. 读取 vvel 数据
+# ============================================================
+
+if not os.path.exists(vvel_file):
+    raise FileNotFoundError(f"没有找到 vvel 文件：\n{vvel_file}")
+
+ds_vvel = xr.open_dataset(vvel_file)
+
+print("\n========== vvel file ==========")
+print(ds_vvel)
+print("\nData variables:")
+for v in ds_vvel.data_vars:
+    print("  ", v)
+
+omega_var = guess_var(ds_vvel, ["vvel", "omega", "w", "wap"])
+
+year_name, pentad_name, level_name, lat_name, lon_name = guess_coord_names_common(ds_vvel)
+
+print("\nomega_var:", omega_var)
+print("year:", year_name)
+print("pentad:", pentad_name)
+print("level:", level_name)
+print("lat:", lat_name)
+print("lon:", lon_name)
+
+if omega_var is None:
+    raise ValueError("没有自动识别出垂直速度变量，请手动指定 omega_var。")
+
+if year_name is None or pentad_name is None or level_name is None or lat_name is None or lon_name is None:
+    raise ValueError("vvel 文件中 year/pentad/level/lat/lon 坐标没有识别完整。")
+
+omega_da = ds_vvel[omega_var]
+omega_da = omega_da.sel({year_name: years_target})
+omega_da = sort_latlon(omega_da, lat_name, lon_name)
+
+level_vals = omega_da[level_name].values.astype(float)
+
+if np.nanmax(level_vals) > 2000:
+    level_hpa = level_vals / 100.0
+else:
+    level_hpa = level_vals.copy()
+
+target_idx = np.argmin(np.abs(level_hpa - TARGET_LEVEL))
+target_level_value = level_hpa[target_idx]
+
+print("Selected omega level:", target_level_value, "hPa")
+
+omega_da = omega_da.isel({level_name: target_idx})
+omega_da = omega_da.transpose(year_name, pentad_name, lat_name, lon_name)
+
+omega_lats = omega_da[lat_name].values
+omega_lons = omega_da[lon_name].values
+
+omega_units = omega_da.attrs.get("units", "Pa s^-1")
+print("omega units:", omega_units)
+print("omega shape:", omega_da.shape)
+
+
+# ============================================================
+# 7. 读取降水数据，用于降水核心区虚线
+# ============================================================
+
+if not os.path.exists(pre_file):
+    raise FileNotFoundError(f"没有找到降水文件：\n{pre_file}")
+
+ds_pre = xr.open_dataset(pre_file)
+
+print("\n========== precipitation file ==========")
+print(ds_pre)
+
+pre_var = guess_precip_var(ds_pre)
+pre_year_name, pre_pentad_name, pre_lat_name, pre_lon_name = guess_precip_coord_names(ds_pre)
+
+print("\npre_var:", pre_var)
+print("year:", pre_year_name)
+print("pentad:", pre_pentad_name)
+print("lat:", pre_lat_name)
+print("lon:", pre_lon_name)
+
+if pre_year_name is None or pre_pentad_name is None or pre_lat_name is None or pre_lon_name is None:
+    raise ValueError("降水文件中 year/pentad/lat/lon 坐标没有识别完整。")
+
+pre = ds_pre[pre_var]
+pre = pre.sel({pre_year_name: years_target})
+pre = sort_latlon(pre, pre_lat_name, pre_lon_name)
+pre = pre.transpose(pre_year_name, pre_pentad_name, pre_lat_name, pre_lon_name)
+
+pre_lats = pre[pre_lat_name].values
+pre_lons = pre[pre_lon_name].values
+
+pre_units = pre.attrs.get("units", "mm")
+print("Precipitation units:", pre_units)
+
+
+# ============================================================
+# 8. 回归计算
+# ============================================================
+
+out_vars = {}
+plot_data = {}
+
+for group_key, pentads in PENTAD_GROUPS.items():
+
+    print("\nProcessing:", group_key, pentads)
+
+    omega_group = omega_da.sel({pentad_name: pentads}).mean(dim=pentad_name)
+    omega_arr = omega_group.values.astype(float)
+
+    if DETREND_OMEGA:
+        omega_for_reg = detrend_3d_nan(omega_arr)
+    else:
+        omega_for_reg = omega_arr.copy()
+
+    omega_beta, omega_r, omega_p = regress_grid(omega_for_reg, wri_for_reg)
+
+    omega_beta_scaled = omega_beta * OMEGA_SCALE
+
+    pre_group = pre.sel({pre_pentad_name: pentads}).mean(dim=pre_pentad_name)
+    pre_arr = pre_group.values.astype(float)
+
+    if DETREND_PRECIP:
+        pre_for_reg = detrend_3d_nan(pre_arr)
+    else:
+        pre_for_reg = pre_arr.copy()
+
+    pre_beta, pre_r, pre_p = regress_grid(pre_for_reg, wri_for_reg)
+
+    out_vars[f"{group_key}_omega500_beta_raw"] = (("lat_omega", "lon_omega"), omega_beta)
+    out_vars[f"{group_key}_omega500_beta_scaled"] = (("lat_omega", "lon_omega"), omega_beta_scaled)
+    out_vars[f"{group_key}_omega500_p"] = (("lat_omega", "lon_omega"), omega_p)
+
+    out_vars[f"{group_key}_pre_beta"] = (("lat_pre", "lon_pre"), pre_beta)
+    out_vars[f"{group_key}_pre_p"] = (("lat_pre", "lon_pre"), pre_p)
+
+    plot_data[group_key] = {
+        "omega_beta_scaled": omega_beta_scaled,
+        "omega_p": omega_p,
+        "pre_beta": pre_beta,
+        "pre_p": pre_p,
+    }
+
+    print(group_key, "omega beta raw min/max:", np.nanmin(omega_beta), np.nanmax(omega_beta))
+    print(group_key, "omega beta scaled min/max:", np.nanmin(omega_beta_scaled), np.nanmax(omega_beta_scaled))
+    print(group_key, "pre beta min/max:", np.nanmin(pre_beta), np.nanmax(pre_beta))
+
+
+ds_out = xr.Dataset(
+    out_vars,
+    coords={
+        "lat_omega": omega_lats,
+        "lon_omega": omega_lons,
+        "lat_pre": pre_lats,
+        "lon_pre": pre_lons,
+    }
+)
+
+ds_out.attrs["description"] = "500 hPa pressure vertical velocity regression onto detrended standardized WRI"
+ds_out.attrs["WRI"] = wri_suffix
+ds_out.attrs["unit_omega_raw"] = "Pa s^-1 per 1 sigma WRI"
+ds_out.attrs["unit_omega_scaled"] = "10^-2 Pa s^-1 per 1 sigma WRI"
+ds_out.attrs["omega_level"] = f"{target_level_value} hPa"
+ds_out.attrs["years"] = f"{YEAR_START}-{YEAR_END}"
+ds_out.attrs["pentad_groups"] = "P44_46 and P47_49"
+
+out_nc = os.path.join(
+    out_dir,
+    f"Fig4_omega500_regression_source_{wri_suffix}.nc"
+)
+
+if os.path.exists(out_nc):
+    os.remove(out_nc)
+
+ds_out.to_netcdf(out_nc)
+
+print("\nSource data saved:")
+print(out_nc)
+
+
+# ============================================================
+# 9. 绘图
+# ============================================================
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(10.0, 3.10),
+    subplot_kw={"projection": proj},
+    dpi=450
+)
+
+axes = axes.flatten()
+panel_letters = ["a", "b"]
+
+cf = None
+
+lon2d_omega, lat2d_omega = np.meshgrid(omega_lons, omega_lats)
+
+for i, (ax, panel_letter, group_key) in enumerate(
+    zip(axes, panel_letters, PENTAD_GROUPS.keys())
+):
+
+    setup_map(
+        ax,
+        add_region_label=True
+    )
+
+    omega_beta_scaled = plot_data[group_key]["omega_beta_scaled"]
+    omega_p = plot_data[group_key]["omega_p"]
+    pre_beta = plot_data[group_key]["pre_beta"]
+
+    if SMOOTH_FIELD:
+        omega_plot = smooth_field(omega_beta_scaled, sigma=SMOOTH_SIGMA)
+    else:
+        omega_plot = omega_beta_scaled
+
+    cf = ax.contourf(
+        omega_lons,
+        omega_lats,
+        omega_plot,
+        levels=OMEGA_LEVELS,
+        cmap=omega_cmap,
+        extend="both",
+        transform=proj,
+        zorder=1
+    )
+
+    try:
+        ax.contour(
+            omega_lons,
+            omega_lats,
+            omega_plot,
+            levels=[0],
+            colors=PALETTE["line_mid"],
+            linewidths=0.50,
+            transform=proj,
+            zorder=5
+        )
+    except Exception:
+        pass
+
+    sig = omega_p < SIG_P_LEVEL
+
+    ax.scatter(
+        lon2d_omega[::SIG_SKIP, ::SIG_SKIP][sig[::SIG_SKIP, ::SIG_SKIP]],
+        lat2d_omega[::SIG_SKIP, ::SIG_SKIP][sig[::SIG_SKIP, ::SIG_SKIP]],
+        s=0.40,
+        color=PALETTE["line_dark"],
+        alpha=0.12,
+        linewidths=0,
+        transform=proj,
+        zorder=7
+    )
+
+    try:
+        ax.contour(
+            pre_lons,
+            pre_lats,
+            pre_beta,
+            levels=[PRECIP_CORE_LEVEL],
+            colors=PALETTE["line_mid"],
+            linewidths=0.70,
+            linestyles=(0, (3.2, 2.0)),
+            transform=proj,
+            zorder=8
+        )
+    except Exception:
+        pass
+
+    ax.set_title(
+        f"({panel_letter}) {PENTAD_LABELS[group_key]}",
+        loc="left",
+        fontsize=10.4,
+        fontweight="bold",
+        pad=7,
+        color=PALETTE["line_dark"],
+        x=0.010
+    )
+
+
+fig.subplots_adjust(
+    left=0.055,
+    right=0.865,
+    top=0.900,
+    bottom=0.165,
+    wspace=0.150
+)
+
+cax = fig.add_axes([0.885, 0.250, 0.010, 0.500])
+
+cbar = fig.colorbar(
+    cf,
+    cax=cax,
+    orientation="vertical",
+    ticks=OMEGA_TICKS
+)
+
+cbar.ax.tick_params(labelsize=8.0, width=0.60, length=2.6, pad=2)
+cbar.outline.set_linewidth(0.60)
+
+cbar.set_label(
+    "500 hPa vertical velocity regression\n"
+    r"($10^{-2}$ Pa s$^{-1}$ per 1σ WRI)",
+    fontsize=8.6,
+    labelpad=6
+)
+
+
+# ============================================================
+# 10. 保存
+# ============================================================
+
+out_svg = os.path.join(
+    out_dir,
+    f"Fig4_omega500_regression_{wri_suffix}_nature_refined.svg"
+)
+
+out_pdf = os.path.join(
+    out_dir,
+    f"Fig4_omega500_regression_{wri_suffix}_nature_refined.pdf"
+)
+
+out_png = os.path.join(
+    out_dir,
+    f"Fig4_omega500_regression_{wri_suffix}_nature_refined.png"
+)
+
+fig.savefig(out_svg, bbox_inches="tight")
+fig.savefig(out_pdf, bbox_inches="tight")
+fig.savefig(out_png, dpi=600, bbox_inches="tight")
+
+plt.show()
+plt.close(fig)
+
+print("\nFigure saved:")
+print(out_svg)
+print(out_pdf)
+print(out_png)
+
+
+# ============================================================
+# 11. 关闭文件
+# ============================================================
+
+ds_vvel.close()
+ds_pre.close()
+ds_out.close()
